@@ -60,11 +60,15 @@ confirm the setpoint defaults). Then **restart Home Assistant**. This creates:
   `server_cool_sp`, `master_cool_sp` / `master_sleep_cool_sp`
 - Enable toggles: `input_boolean.nursery_enabled`, `server_enabled`, `master_enabled`
 - Demand helpers: `input_text.nursery_demand`, `master_demand`, `server_demand`
-- `input_boolean.zc_sleep_mode`, `input_boolean.zc_home_occupied`
 - `input_datetime.zc_last_changeover`
 - Setpoint force-run: `input_boolean.zc_setpoint_manual`,
   `input_number.zc_last_cmd_setpoint`, `input_datetime.zc_manual_until`
 - `zone.home_wide` (~5 mi)
+
+> The **sleep-mode** and **home-occupied** booleans are **not** created by the
+> package — use your existing helpers. The steps below refer to them as
+> `input_boolean.<your_sleep_mode>` and `input_boolean.<your_home_occupied>`;
+> substitute your own entity IDs.
 
 ## 2. Import the blueprints
 
@@ -98,11 +102,11 @@ Create **one automation per conditioned room** from the **Room Zone** blueprint.
 - Cool setpoint: `input_number.master_cool_sp` · Enable cooling: **on**
 - Heat setpoint: *(leave unset)* · Enable heating: **off**
 - Zone mode: **Occupancy** · Occupancy sensor: `binary_sensor.master_bedroom_occupancy`
-- Sleep mode boolean: `input_boolean.zc_sleep_mode`
+- Sleep mode boolean: `input_boolean.<your_sleep_mode>`
 - Sleep / pre-cool cool setpoint: `input_number.master_sleep_cool_sp`
 - **Scheduled activation** (pre-cool for sleep):
   - Active after: **20:00:00** · Active until: **07:00:00**
-  - Schedule requires house occupied: `input_boolean.zc_home_occupied`
+  - Schedule requires house occupied: `input_boolean.<your_home_occupied>`
 
   This makes the master bedroom start pre-cooling around 8pm whenever the house
   is occupied, on top of its occupancy behaviour (the window runs overnight to
@@ -140,7 +144,7 @@ Create **one** automation from the **Coordinator** blueprint:
 - Relief valve damper switch: `switch.damper_theater`
 - Compressor reversal cooldown: **3** (minutes)
 - Last-changeover helper: `input_datetime.zc_last_changeover`
-- Home occupied toggle: `input_boolean.zc_home_occupied`
+- Home occupied toggle: `input_boolean.<your_home_occupied>`
 - Wide presence zone: `zone.home_wide`
 - Away action: **Set eco preset** *(keeps the unit running so the server room
   stays cooled while the house is empty)*
@@ -200,11 +204,11 @@ satisfied. The target is clamped between the floor and ceiling.
    theater damper goes **on** (closed).
 6. **Main on/off.** With a room calling, the unit switches on in the winning
    direction. With every room satisfied/disabled, it switches off.
-7. **Sleep / pre-cool.** Turn on `input_boolean.zc_sleep_mode`; the master
+7. **Sleep / pre-cool.** Turn on `input_boolean.<your_sleep_mode>`; the master
    bedroom uses the 68 °F sleep cool setpoint. The same 68 °F target applies
    automatically inside the 20:00–07:00 window (house occupied) without touching
    the toggle — so an evening reading above 68 begins pre-cooling on its own.
-8. **Away.** Turn off `input_boolean.zc_home_occupied` with nobody in
+8. **Away.** Turn off `input_boolean.<your_home_occupied>` with nobody in
    `zone.home_wide`; the configured away action fires (eco preset by default).
 9. **Force-run.** With force-run enabled, set the central thermostat to a mild
    value (e.g. 72) while a room calls for cooling and the hallway is cooler than

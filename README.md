@@ -108,10 +108,11 @@ Runs once for the whole house. It:
   to an eco preset so an always-on room keeps running while the house is empty.
 
 ### 3. Helper package — `packages/zone_controller.yaml`
-Creates the supporting entities: per-room setpoints (`input_number`), enable
-toggles and sleep/home toggles (`input_boolean`), per-room demand helpers
-(`input_text`), the changeover timestamp (`input_datetime`), and the wide
-presence `zone`.
+Creates the supporting entities: per-room setpoints (`input_number`), per-room
+enable toggles (`input_boolean`), per-room demand helpers (`input_text`), the
+changeover timestamp (`input_datetime`), and the wide presence `zone`. It does
+**not** create the sleep-mode or home-occupied booleans — point the blueprints at
+your existing ones.
 
 ### 4. Firmware — `YAML`
 The ESPHome config for the KC868 board that exposes the damper relays to Home
@@ -182,8 +183,8 @@ Create one automation from the **Coordinator** blueprint. The important field is
 damper, the changeover helper, and the home/away entities.
 
 ### 5. Add dashboard toggles (optional)
-Put the enable toggles (`input_boolean.*_enabled`), `input_boolean.zc_sleep_mode`,
-and `input_boolean.zc_home_occupied` on a dashboard for easy control.
+Put the enable toggles (`input_boolean.*_enabled`) plus your existing sleep-mode
+and home-occupied booleans on a dashboard for easy control.
 
 Full step-by-step field values and a verification checklist are in
 **[docs/zone-controller-setup.md](docs/zone-controller-setup.md)**.

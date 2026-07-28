@@ -2,8 +2,12 @@
 # Zone Controller - example Home Assistant package
 # =============================================================================
 # This package creates the helper entities the Zone Controller blueprints need:
-# per-room setpoints (input_number), the sleep-mode and home/away toggles
-# (input_boolean), and a wide (~5 mi) presence zone.
+# per-room setpoints (input_number), per-room enable toggles (input_boolean),
+# demand + bookkeeping helpers, and a wide (~5 mi) presence zone.
+#
+# It deliberately does NOT create the sleep-mode or home-occupied booleans -
+# most setups already have those. Point the blueprint inputs at your existing
+# ones (see the prerequisites list below).
 #
 # To use it:
 #   1. Ensure packages are enabled in configuration.yaml, e.g.:
@@ -34,6 +38,9 @@
 #       switch.damper_theater          (relief valve)
 #   - Main upstairs unit:
 #       climate.upstairs_hvac
+#   - Your existing toggles (this package does NOT create these):
+#       input_boolean.<your_sleep_mode>       (master sleep / pre-cool override)
+#       input_boolean.<your_home_occupied>    (home/away toggle)
 # =============================================================================
 
 input_number:
@@ -105,13 +112,8 @@ input_boolean:
     name: Master bedroom enabled
     icon: mdi:bed
 
-  zc_sleep_mode:
-    name: Sleep mode
-    icon: mdi:power-sleep
-
-  zc_home_occupied:
-    name: Home occupied
-    icon: mdi:home-account
+  # NOTE: sleep-mode and home-occupied booleans are intentionally NOT created
+  # here - point the blueprints at your existing ones.
 
   # Manual setpoint override for the coordinator's force-run feature.
   zc_setpoint_manual:
