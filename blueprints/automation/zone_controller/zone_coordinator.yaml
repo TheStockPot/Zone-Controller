@@ -1,0 +1,1231 @@
+blueprint:
+  name: AryaNakh's Zone Controller - Coordinator (v0.3)
+  author: AryaNakh
+  description: >
+    House-level coordinator for a ducted HVAC zoning system. Run ONE instance.
+
+    A single air handler can only blow hot OR cold air at any moment - it cannot
+    heat one room while cooling another. So this coordinator arbitrates the whole
+    unit's direction by room priority, and it does four jobs:
+
+      1. Direction by priority - it reads each room's demand helper (heat / cool /
+         none) in priority order. The highest-priority room that is calling sets
+         the unit's direction. Lower-priority rooms wanting the opposite direction
+         wait (their dampers stay closed) until it is satisfied.
+
+      2. Compressor reversal cooldown - it will not flip heat <-> cool again
+         until a short hardware-protection cooldown has passed, UNLESS no room is
+         still calling in the current direction (in which case flipping is not a
+         short-cycle). This cooldown is the ONLY thing that can delay serving a
+         higher-priority room; priority itself is never yielded to a
+         lower-priority room. It stamps the last changeover into an
+         input_datetime helper.
+
+      3. Pressure relief - it decides when the theater / bonus damper must open
+         as the last-resort relief valve: when every other damper is closed, AND
+         (while cooling) whenever fewer than "Minimum open zones while cooling"
+         room dampers are open - so the unit never runs through a single small
+         zone (high static pressure). It publishes that decision to the "Theater
+         relief output" flag, which the theater's own Room Zone uses to open its
+         damper. (It can still drive a relief damper directly if you set one -
+         the older setup.) It also publishes a cooling-relief flag so a ride-along
+         room (the server) is the preferred relief path. Heating is unaffected.
+         The theater as a guest bedroom (guest mode, setpoints, pre-cool, boost)
+         is handled by its own Room Zone automation, not here.
+
+      4. Home / away - when nobody is home (a toggle is off AND nobody is inside a
+         wide ~5 mi presence zone) it reduces conditioning. An optional house-mode
+         input_select overrides this: "Away" forces the eco preset (Eco mode) and
+         "Vacation" turns the unit off entirely.
+
+      5. Idle behavior - what to do when NO room is calling. Choose one:
+         - Off: turn the unit off (original behavior).
+         - Off + high-temp cap: off, but force cooling if the sensed (hallway)
+           temperature climbs above the high limit (a cooling-only backstop).
+         - Hold heat_cool band: keep the unit in heat_cool on a low/high band
+           (default 64-76) so the whole house stays between them - a high AND low
+           whole-house backstop, using the unit's native dual-setpoint control.
+         A room's demand always takes priority over the idle backstop.
+
+    Damper polarity is INVERTED (normally-open): off = OPEN, on = CLOSED.
+
+    Note: because arbitration requires it, this coordinator fully owns the unit's
+    hvac_mode - a manual mode change will be overridden.
+
+    Away note: the default away action sets an eco preset rather than turning the
+    unit off, so an always-on room (e.g. a server room) keeps cooling while the
+    house is empty. Choose "Turn off" only if no room must run regardless of
+    occupancy. NOTE: the house-mode "Vacation" value turns the whole unit off,
+    which also stops any always-on room (e.g. the server room) - use "Away" if
+    the server room must keep cooling while you travel. A house-mode change is
+    picked up on the next safety re-sync (within ~2 min).
+  domain: automation
+  source_url: https://github.com/aryanakh/zone-controller/blob/main/blueprints/automation/zone_controller/zone_coordinator.yaml
+  input:
+    hvac_section:
+      name: HVAC & Dampers
+      icon: mdi:hvac
+      collapsed: false
+      input:
+        main_climate:
+          name: Main HVAC climate entity
+          description: The upstairs unit this coordinator drives.
+          selector:
+            entity:
+              filter:
+                - domain: climate
+        zone_demands:
+          name: Room demand helpers, HIGHEST PRIORITY FIRST
+          description: >
+            The per-room demand input_text helpers, ordered by priority (add the
+            highest-priority room first). Order IS the priority. For this house:
+            nursery, then master bedroom, then server room, then the theater's
+            theater_demand helper LAST (lowest priority). The theater's Room Zone
+            only publishes demand while guest mode is on, so it's harmless to
+            leave it listed when guest mode is off.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: input_text
+        zone_dampers:
+          name: Room damper switches (all non-relief dampers)
+          description: >
+            Every room damper switch EXCEPT the theater (relief valve) - i.e.
+            nursery, server room and both master bedroom dampers. off = open,
+            on = closed. Do NOT add the theater damper here, or its relief opening
+            would count toward the minimum and make it flip open/closed.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: switch
+        theater_relief_helper:
+          name: Theater relief output (input_boolean, recommended)
+          description: >
+            An input_boolean the coordinator turns ON whenever the theater must
+            open as the pressure-relief valve (every room damper closed, or too
+            few open while cooling) and OFF otherwise. Point the theater Room
+            Zone's "Force open while this is on" at this helper - that's how the
+            theater stays the last-resort relief valve now that it has its own
+            controller.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        relief_damper:
+          name: Relief valve damper switch (legacy, optional)
+          description: >
+            LEGACY - leave this EMPTY once the theater has its own Room Zone (use
+            the "Theater relief output" above instead). If set, the coordinator
+            drives this damper directly as the relief valve, which would fight the
+            theater's Room Zone.
+          default: {}
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: switch
+        min_open_zones_cool:
+          name: Minimum open zones while cooling
+          description: >
+            To protect the blower/coil from high static pressure, while the unit
+            is COOLING the theater relief damper opens whenever fewer than this
+            many room dampers are open - so there are always at least this many
+            open airflow paths (e.g. one bedroom plus the theater). Set to 1 for
+            the original behavior (relief only when every room is closed). Heating
+            is unaffected. Never heats or over-cools a bedroom - it only opens the
+            theater/bonus room.
+          default: 2
+          selector:
+            number:
+              min: 1
+              max: 4
+              step: 1
+              mode: box
+        cool_relief_helper:
+          name: Cooling-relief-needed output (input_boolean, optional)
+          description: >
+            Optional input_boolean the coordinator turns ON while the unit is
+            cooling AND fewer than "Minimum open zones while cooling" PRIMARY room
+            dampers are actually open - i.e. an extra zone is needed for pressure
+            relief. Point a relief room's Room Zone "Ride along only while this is
+            on" at this helper so that room (e.g. the server) opens for relief ONLY
+            when it's genuinely needed - and becomes the DEFAULT cooling relief
+            path so the theater is only a last resort. "Primary" = the room dampers
+            minus the relief room's own (below), so the relief room opening never
+            counts as satisfying the minimum (no flip-flop). This means the server
+            also picks up relief when a bedroom has YIELDED its damper (e.g. the
+            master yielding to the nursery during the day) - not just when a room
+            is fully satisfied.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        relief_ride_dampers:
+          name: Relief (ride-along) room damper(s) to exclude from the count
+          description: >
+            The damper(s) of the ride-along relief room (e.g. the server), so its
+            own relief opening is NOT counted toward "Minimum open zones while
+            cooling" - otherwise it would open, satisfy the count, close, and
+            oscillate. Set this to the same switch(es) as that room's dampers.
+            Leave unset to fall back to counting rooms CALLING (which doesn't
+            account for a yielded damper). Recommended: set it to the server
+            damper.
+          default: {}
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: switch
+        min_changeover:
+          name: Compressor reversal cooldown (minutes)
+          description: >
+            Hardware protection ONLY. The unit will not reverse heat <-> cool
+            again until this many minutes have passed since the last direction
+            change (unless nothing is still calling in the current direction, in
+            which case reversing is not a short-cycle). This is the ONLY thing
+            that can delay serving a higher-priority room - priority is never
+            yielded to a lower-priority room. Keep it short; set 0 for instant
+            reversal.
+          default: 3
+          selector:
+            number:
+              min: 0
+              max: 60
+              step: 1
+              unit_of_measurement: min
+              mode: box
+        changeover_helper:
+          name: Last-changeover helper (input_datetime)
+          description: An input_datetime (date + time) used to remember when the unit last changed direction.
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+        status_helper:
+          name: Status / decision output (input_text, optional)
+          description: >
+            Optional input_text the coordinator writes a one-line summary of each
+            decision to (e.g. "Cooling: Master bedroom · set 68° (hall 70°) · Home Night").
+            It only rewrites when the decision changes, so watch its last-changed
+            time to see when the coordinator last acted.
+            Purely diagnostic - watch it to see what the coordinator did and why.
+            Create the helper with max length 255 so long lines aren't truncated.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        bypass:
+          name: Full manual override / bypass (optional)
+          description: >
+            An input_boolean. While ON, the coordinator does NOTHING - it will not
+            touch the unit's on/off, mode, setpoint, or the theater/relief damper -
+            so you have full manual control of the HVAC until you turn it off. Use
+            the SAME toggle in every Room Zone so the rooms also stop driving their
+            dampers, giving you complete manual control of the whole system.
+            (This is broader than the setpoint-only "Manual setpoint override".)
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+
+    presence_section:
+      name: Home / Away
+      icon: mdi:home-account
+      collapsed: false
+      input:
+        house_mode:
+          name: House mode selector (optional)
+          description: >
+            An optional input_select that overrides home/away. When it equals the
+            "Away" value below the unit is forced into the eco preset (Eco mode);
+            when it equals the "Vacation" value the unit is turned off entirely.
+            Any other value (e.g. Home) falls back to the presence logic below.
+            Leave unset to rely only on the toggle + presence zone.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_select
+        house_mode_away:
+          name: House mode - "Away" value
+          description: The input_select option that means Away (forces the eco preset).
+          default: Away
+          selector:
+            text:
+        house_mode_vacation:
+          name: House mode - "Vacation" value
+          description: The input_select option that means Vacation (turns the unit off).
+          default: Vacation
+          selector:
+            text:
+        home_occupied:
+          name: Home occupied toggle
+          description: An input_boolean that is on while the house should be treated as occupied.
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        presence_zone:
+          name: Wide presence zone (optional)
+          description: >
+            A large (~5 mi) HA zone. If anyone is inside it the house is treated
+            as occupied/approaching. Leave unset to rely only on the toggle.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: zone
+        away_action:
+          name: Away action
+          description: What to do while nobody is home.
+          default: eco_preset
+          selector:
+            select:
+              options:
+                - label: Set eco preset (keeps the unit running - safe for always-on rooms)
+                  value: eco_preset
+                - label: Do nothing special (rely on occupancy-gated rooms)
+                  value: none
+                - label: Turn the unit off (WARNING - stops all rooms, incl. server room)
+                  value: turn_off
+        away_preset:
+          name: Away preset name
+          description: Preset to select while away (used by the "Set eco preset" away action).
+          default: eco
+          selector:
+            text:
+        home_preset:
+          name: Home preset name
+          description: Preset to restore when returning home (used by the "Set eco preset" away action).
+          default: none
+          selector:
+            text:
+        night_start:
+          name: Night starts at (time of day)
+          description: >
+            Used only to label the status line "Home Night" vs "Home Day". The
+            night window may cross midnight (e.g. 21:00 -> 07:00). Purely cosmetic.
+          default: "21:00:00"
+          selector:
+            time:
+        night_end:
+          name: Night ends at (time of day)
+          description: End of the night window (for the "Home Night" status label).
+          default: "07:00:00"
+          selector:
+            time:
+        night_boolean:
+          name: Night/sleep toggle (optional)
+          description: >
+            Optional input_boolean (e.g. your sleep toggle). While on, the status
+            shows "Home Night" regardless of the time window above. Status label
+            only - it does not change any conditioning behavior.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+
+    comfort_section:
+      name: Idle Behavior (no room calling)
+      icon: mdi:hvac-off
+      collapsed: false
+      input:
+        idle_mode:
+          name: Idle behavior
+          description: >
+            What the coordinator does when NO room is calling for heat or cool.
+            - Turn the unit off: fully off (original behavior).
+            - Off + high-temp cap: off, but force cooling if the sensed (hallway)
+              temperature climbs above the high limit below (a cooling-only
+              backstop; needs Setpoint Force-Run on to actually run).
+            - Hold a heat_cool safety band: keep the unit in heat_cool holding the
+              low/high band below, so the whole house stays between them - a high
+              AND low backstop. Your unit must support a heat_cool / auto range
+              mode. While idling this uses the unit's own dual-setpoint control,
+              but you MUST keep Setpoint Force-Run (below) enabled: when a room
+              starts calling, the unit switches to a single mode and inherits the
+              band's target (e.g. the high) - force-run is what overrides that so
+              the unit actually runs for the room.
+          default: hold_band
+          selector:
+            select:
+              options:
+                - label: Turn the unit off
+                  value: "off"
+                - label: Off, but force cooling above the high limit (cap)
+                  value: cap
+                - label: Hold a heat_cool safety band (high + low backstop)
+                  value: hold_band
+        idle_high:
+          name: High limit / band high (deg)
+          description: >
+            Upper temperature. In "cap" mode: cooling is forced when the sensed
+            hallway rises above this (releasing ~0.5 below). In "band" mode: the
+            heat_cool cool target - the unit cools to keep the house below it.
+            Ignored when idle behavior is "Turn the unit off". Default 76.
+          default: 76
+          selector:
+            number:
+              min: 60
+              max: 90
+              step: 0.5
+              unit_of_measurement: deg
+              mode: box
+        idle_low:
+          name: Band low (deg)
+          description: >
+            Lower temperature for "Hold a heat_cool safety band" mode only - the
+            heat_cool heat target the unit heats to keep the house above. Keep it
+            well below the high limit. Ignored in the other idle modes. Default 64.
+          default: 64
+          selector:
+            number:
+              min: 50
+              max: 78
+              step: 0.5
+              unit_of_measurement: deg
+              mode: box
+
+    purge_section:
+      name: Away Circulation Purge (optional)
+      icon: mdi:fan-alert
+      collapsed: true
+      input:
+        purge_enabled:
+          name: Run a circulation purge while away
+          description: >
+            While the house is away (or on vacation), periodically run the blower
+            in fan-only with every damper open, to move air through all the ducts
+            and discourage stagnant-air mold / condensation. It never heats or
+            cools - it only circulates - and it yields the unit instantly the
+            moment a room calls or you come home. Off by default. Requires the
+            purge-window helper below, and each Room Zone must point its own
+            "Circulation purge window" at that same helper to open its damper.
+          default: false
+          selector:
+            boolean:
+        purge_interval_hours:
+          name: Purge every (hours)
+          description: >
+            How often to run a purge while the house stays away. The first purge
+            runs shortly after the house goes away (or on the next re-sync).
+          default: 8
+          selector:
+            number:
+              min: 1
+              max: 72
+              step: 1
+              unit_of_measurement: h
+              mode: box
+        purge_minutes:
+          name: Purge duration (minutes)
+          description: How long each fan-only purge runs before returning to normal.
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 120
+              step: 1
+              unit_of_measurement: min
+              mode: box
+        purge_include_vacation:
+          name: Also purge during Vacation
+          description: >
+            Include the house-mode "Vacation" state (when the unit is otherwise
+            fully off). Recommended - a vacation is the longest the ducts sit
+            unused, so it's the case that benefits most. When off, purges run only
+            in the Away / presence-away state.
+          default: true
+          selector:
+            boolean:
+        purge_fan_mode:
+          name: Fan-only mode name
+          description: >
+            The hvac_mode used for the purge. Almost all ducted units expose
+            "fan_only"; change this only if yours names it differently.
+          default: fan_only
+          selector:
+            text:
+        purge_until:
+          name: Purge-window helper (input_datetime)
+          description: >
+            An input_datetime (date + time) the coordinator uses to time the purge
+            window (it stores when the current purge ends). REQUIRED for the purge.
+            Point every Room Zone's "Circulation purge window" input at this SAME
+            helper so the rooms open their dampers while the purge is running.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+
+    setpoint_section:
+      name: Setpoint Force-Run (optional)
+      icon: mdi:thermostat
+      collapsed: true
+      input:
+        manage_setpoint:
+          name: Manage the unit's setpoint
+          description: >
+            The central thermostat senses the hallway, so a mild setpoint plus a
+            cold/warm hallway can stop the unit from running even when a room
+            needs air. When enabled, the coordinator pushes the unit's target a
+            few degrees past the sensed (hallway) temperature so it actually runs
+            in the winning direction. Leave off to only control the mode.
+          default: false
+          selector:
+            boolean:
+        run_offset:
+          name: Force-run offset (°)
+          description: >
+            How far past the sensed temperature to drive the target. Cooling
+            target = sensed - offset; heating target = sensed + offset.
+          default: 2
+          selector:
+            number:
+              min: 1
+              max: 8
+              step: 0.5
+              unit_of_measurement: "°"
+              mode: box
+        setpoint_floor:
+          name: Setpoint floor (°)
+          description: The lowest target the coordinator will command (clamp).
+          default: 60
+          selector:
+            number:
+              min: 40
+              max: 75
+              step: 1
+              unit_of_measurement: "°"
+              mode: box
+        setpoint_ceiling:
+          name: Setpoint ceiling (°)
+          description: The highest target the coordinator will command (clamp).
+          default: 85
+          selector:
+            number:
+              min: 75
+              max: 95
+              step: 1
+              unit_of_measurement: "°"
+              mode: box
+        setpoint_manual:
+          name: Manual setpoint override toggle (optional)
+          description: >
+            An input_boolean. While on, the coordinator never touches the
+            setpoint - you have full manual control. Turn it off to hand control
+            back to the coordinator.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        enable_manual_grace:
+          name: Enable auto manual-edit grace
+          description: >
+            OFF (default) is recommended. When ON, the coordinator tries to detect
+            a by-hand setpoint change and then leaves the setpoint alone for the
+            grace period below. It needs the two helpers below AND is sensitive to
+            thermostat quirks (stepping, clamping, C/F rounding) that can make it
+            wrongly think you edited the setpoint and get "stuck" leaving the
+            thermostat alone. Leave OFF and use the hard "Manual setpoint override
+            toggle" above for deliberate manual control - that never gets stuck.
+          default: false
+          selector:
+            boolean:
+        manual_grace:
+          name: Manual-edit grace (minutes)
+          description: >
+            Only used when "Enable auto manual-edit grace" above is ON. How long to
+            leave a detected by-hand setpoint change alone before resuming force-run.
+          default: 30
+          selector:
+            number:
+              min: 0
+              max: 240
+              step: 5
+              unit_of_measurement: min
+              mode: box
+        last_cmd_setpoint:
+          name: Last-commanded setpoint helper (input_number, optional)
+          description: Bookkeeping - stores the last target the coordinator set, so it can detect manual edits.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_number
+        manual_until:
+          name: Manual-grace-until helper (input_datetime, optional)
+          description: Bookkeeping - stores when the manual-edit grace period ends.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  main_climate: !input main_climate
+  zone_demands: !input zone_demands
+  zone_dampers: !input zone_dampers
+  relief_damper: !input relief_damper
+  theater_relief_helper: !input theater_relief_helper
+  # Legacy direct drive: only touch relief_damper when one is actually set (an
+  # unset optional input is an empty dict).
+  relief_damper_set: >
+    {{ relief_damper is string
+       or (relief_damper is not mapping and relief_damper | count > 0) }}
+  min_open_zones_cool: !input min_open_zones_cool
+  cool_relief_helper: !input cool_relief_helper
+  relief_ride_dampers: !input relief_ride_dampers
+  min_changeover: !input min_changeover
+  changeover_helper: !input changeover_helper
+  status_helper: !input status_helper
+  bypass: !input bypass
+  bypassed: "{{ bypass is string and is_state(bypass, 'on') }}"
+  house_mode: !input house_mode
+  house_mode_away: !input house_mode_away
+  house_mode_vacation: !input house_mode_vacation
+  home_occupied: !input home_occupied
+  presence_zone: !input presence_zone
+  away_action: !input away_action
+  away_preset: !input away_preset
+  home_preset: !input home_preset
+  night_start: !input night_start
+  night_end: !input night_end
+  night_boolean: !input night_boolean
+  idle_mode: !input idle_mode
+  idle_high: !input idle_high
+  idle_low: !input idle_low
+  purge_enabled: !input purge_enabled
+  purge_interval_hours: !input purge_interval_hours
+  purge_minutes: !input purge_minutes
+  purge_include_vacation: !input purge_include_vacation
+  purge_fan_mode: !input purge_fan_mode
+  purge_until: !input purge_until
+  manage_setpoint: !input manage_setpoint
+  run_offset: !input run_offset
+  setpoint_floor: !input setpoint_floor
+  setpoint_ceiling: !input setpoint_ceiling
+  setpoint_manual: !input setpoint_manual
+  enable_manual_grace: !input enable_manual_grace
+  manual_grace: !input manual_grace
+  last_cmd_setpoint: !input last_cmd_setpoint
+  manual_until: !input manual_until
+  # --- presence ---
+  home_toggle: "{{ is_state(home_occupied, 'on') }}"
+  anyone_near: >
+    {{ presence_zone is string and (states(presence_zone) | int(0) > 0) }}
+  home: "{{ home_toggle or anyone_near }}"
+  # Night vs day - status label only (does not change conditioning). Night when
+  # the optional night toggle is on, or inside the night window (may cross midnight).
+  now_hms: "{{ now().strftime('%H:%M:%S') }}"
+  has_night_window: "{{ night_start is string and night_end is string }}"
+  in_night_window: >
+    {{ false if not has_night_window
+       else (night_start <= now_hms < night_end)
+         if (night_start <= night_end)
+       else (now_hms >= night_start or now_hms < night_end) }}
+  is_night: >
+    {{ (night_boolean is string and is_state(night_boolean, 'on')) or in_night_window }}
+  # --- house mode selector (optional 3-state override) ---
+  hm_state: "{{ states(house_mode) if house_mode is string else '' }}"
+  hm_away: "{{ house_mode is string and hm_state == house_mode_away }}"
+  hm_vacation: "{{ house_mode is string and hm_state == house_mode_vacation }}"
+  # Turn the whole unit off? Vacation, or presence-away with the turn_off action.
+  force_off: >
+    {{ hm_vacation or (not home and away_action == 'turn_off') }}
+  # Hold the unit in the eco preset (but keep it running)? Away mode, or
+  # presence-away with the eco action - unless we are turning the unit off.
+  want_eco: >
+    {{ not force_off
+       and (hm_away or (away_action == 'eco_preset' and not home)) }}
+  # --- priority arbitration ---
+  # First demand helper (in priority order) that is calling wins the direction.
+  room_dir: >
+    {% set ns = namespace(dir='none') %}
+    {% for d in zone_demands %}
+      {% if ns.dir == 'none' and states(d) in ['heat', 'cool'] %}
+        {% set ns.dir = states(d) %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.dir }}
+  main_state: "{{ states(main_climate) }}"
+  main_dir: "{{ main_state if main_state in ['heat', 'cool'] else 'off' }}"
+  # --- idle behavior (what to do when no room is calling) ---
+  idle_hold: "{{ idle_mode == 'hold_band' }}"
+  cap_enabled: "{{ idle_mode == 'cap' }}"
+  # Hallway high-temp cap ("cap" mode only): the unit senses the hallway, so if
+  # no room is calling but the hallway is over the high limit, force cooling.
+  # Engage above it, release ~0.5 below (unit already cooling = memory).
+  cap_sensed_raw: "{{ state_attr(main_climate, 'current_temperature') }}"
+  cap_sensed: "{{ cap_sensed_raw | float(0) }}"
+  cap_active: >
+    {{ cap_enabled and is_number(cap_sensed_raw) and room_dir == 'none'
+       and (cap_sensed > idle_high
+            or (main_dir == 'cool' and cap_sensed > idle_high - 0.5)) }}
+  # A room's demand wins; otherwise the cap can force cooling (in "cap" mode).
+  winner_dir: "{{ room_dir if room_dir != 'none' else ('cool' if cap_active else 'none') }}"
+  # --- away circulation purge ---
+  # While away and nothing is calling, periodically run the fan with every damper
+  # open (mold / condensation prevention). purge_until stores when the current
+  # window ends; the last window START is (purge_until - duration), so the next
+  # purge is due one interval after that. An unset helper reads as 0 => due now,
+  # so the first purge fires as soon as the house is away.
+  house_away: "{{ hm_vacation or hm_away or not home }}"
+  now_ts: "{{ as_timestamp(now()) }}"
+  purge_until_ts: "{{ as_timestamp(states(purge_until), 0) if purge_until is string else 0 }}"
+  purge_window_s: "{{ (purge_minutes | float(0)) * 60 }}"
+  purge_interval_s: "{{ (purge_interval_hours | float(0)) * 3600 }}"
+  purge_running: "{{ purge_enabled and purge_until is string and now_ts < purge_until_ts }}"
+  purge_next_due_ts: "{{ (purge_until_ts - purge_window_s) + purge_interval_s }}"
+  purge_due: "{{ now_ts >= purge_next_due_ts }}"
+  # Eligible this cycle: feature on, helper present, house away (honouring the
+  # vacation opt-in), and NO room / cap is calling (a real demand always wins).
+  purge_state_ok: >
+    {{ purge_enabled and purge_until is string and house_away
+       and (purge_include_vacation or not hm_vacation)
+       and winner_dir == 'none' }}
+  purge_now: "{{ purge_state_ok and (purge_running or purge_due) }}"
+  purge_start: "{{ purge_now and not purge_running }}"
+  purge_new_until_ts: "{{ now_ts + purge_window_s }}"
+  # Is the unit already holding the idle heat_cool band (so we can skip re-commanding)?
+  main_ttl: "{{ state_attr(main_climate, 'target_temp_low') }}"
+  main_tth: "{{ state_attr(main_climate, 'target_temp_high') }}"
+  idle_band_set: >
+    {{ main_state == 'heat_cool' and is_number(main_ttl) and is_number(main_tth)
+       and (main_ttl | float(0) - idle_low) | abs < 0.5
+       and (main_tth | float(0) - idle_high) | abs < 0.5 }}
+  # Is any room still calling in the direction the unit is currently running?
+  current_dir_still_calling: >
+    {{ main_dir in ['heat', 'cool']
+       and (zone_demands | select('is_state', main_dir) | list | count > 0) }}
+  # --- anti-short-cycle ---
+  mins_since_change: >
+    {{ (as_timestamp(now()) - as_timestamp(states(changeover_helper), 0)) / 60 }}
+  lockout_passed: "{{ mins_since_change >= min_changeover }}"
+  # A heat<->cool flip is allowed if enough time passed, or nothing is still
+  # calling in the current direction (so switching is not a short-cycle).
+  allow_flip: "{{ lockout_passed or not current_dir_still_calling }}"
+  need_flip: "{{ main_dir in ['heat', 'cool'] and winner_dir in ['heat', 'cool'] and winner_dir != main_dir }}"
+  # --- relief / theater damper ---
+  all_others_closed: "{{ zone_dampers | reject('is_state', 'off') | list | count == (zone_dampers | count) }}"
+  # How many room dampers are currently open (off = open). Used to keep enough
+  # airflow paths open while cooling so static pressure stays reasonable.
+  open_room_count: "{{ zone_dampers | select('is_state', 'off') | list | count }}"
+  # How many rooms are actually CALLING for cool right now (demand-based, so it
+  # doesn't depend on damper feedback - a satisfied room riding along is NOT
+  # counted). Relief (a ride-along room) is only "needed" while cooling with fewer
+  # of these than the minimum, so the bedrooms keep the full airflow until one of
+  # them reaches temperature and drops out. Published to cool_relief_helper.
+  cool_callers: "{{ zone_demands | select('is_state', 'cool') | list | count }}"
+  cooling_active: "{{ main_state in ['cool', 'heat_cool'] or winner_dir == 'cool' }}"
+  # The relief (ride-along) room's own dampers, excluded from the primary count so
+  # its own relief opening can't satisfy the minimum (which would make it oscillate
+  # open/closed). Unset = empty list -> fall back to counting callers.
+  relief_ride_list: >
+    {{ relief_ride_dampers
+       if (relief_ride_dampers is not mapping and relief_ride_dampers is not string)
+       else [] }}
+  # How many PRIMARY room dampers are open (off = open) - i.e. all room dampers
+  # except the relief room's. This counts a bedroom that has YIELDED its damper as
+  # NOT open, so the relief room fills in for it (day nursery-focus), and it never
+  # counts the relief room itself (no flip-flop).
+  primary_open_count: >
+    {{ zone_dampers | reject('in', relief_ride_list)
+       | select('is_state', 'off') | list | count }}
+  # Relief is needed while cooling with fewer than the minimum primary zones open.
+  # This makes the relief room (server) the DEFAULT relief path - the theater only
+  # opens as a last resort (via relief_needed / open_room_count below). When no
+  # relief dampers are configured, fall back to the caller count.
+  cool_relief_needed: >
+    {{ cooling_active and (
+         (primary_open_count < min_open_zones_cool) if (relief_ride_list | count > 0)
+         else (cool_callers < min_open_zones_cool)
+       ) }}
+  # Pressure relief is needed when: every room is closed (any mode), OR - while
+  # cooling - fewer than the minimum zones are open (open the theater as an extra
+  # path so we never run through a single small zone).
+  relief_needed: >
+    {{ all_others_closed
+       or (main_state in ['cool', 'heat_cool'] and open_room_count < min_open_zones_cool) }}
+  # The theater opens as the relief valve exactly when relief is needed. This is
+  # published to theater_relief_helper (the theater's Room Zone opens on it) and,
+  # in the legacy setup only, drives relief_damper directly. Guest-room service is
+  # the theater Room Zone's own job now.
+  theater_open: "{{ relief_needed }}"
+  current_preset: "{{ state_attr(main_climate, 'preset_mode') }}"
+  # --- setpoint force-run ---
+  # Force-run whenever a room (or the cap) is calling and we're not forced off.
+  # In Eco Away we still serve rooms - each caps itself at its own away setpoint.
+  unit_should_run: >
+    {{ winner_dir in ['heat', 'cool'] and not force_off }}
+  sensed_raw: "{{ state_attr(main_climate, 'current_temperature') }}"
+  sensed_valid: "{{ is_number(sensed_raw) }}"
+  sensed: "{{ sensed_raw | float(0) }}"
+  cur_sp_raw: "{{ state_attr(main_climate, 'temperature') }}"
+  cur_sp_valid: "{{ is_number(cur_sp_raw) }}"
+  cur_sp: "{{ cur_sp_raw | float(0) }}"
+  # The thermostat's setpoint resolution (default 1 deg). Used to round the target
+  # so what we command equals what the thermostat stores back - otherwise a
+  # fractional target the thermostat rounds looks like a manual edit next cycle.
+  sp_step: >
+    {% set s = state_attr(main_climate, 'target_temp_step') | float(0) %}
+    {{ s if s > 0 else 1 }}
+  # Never command below/above what the thermostat itself accepts - a value it
+  # clamps to its own min/max would read back different from what we recorded and
+  # look like a manual edit. Combine our floor/ceiling with the unit's min/max.
+  sp_lo: "{{ [setpoint_floor, state_attr(main_climate, 'min_temp') | float(setpoint_floor)] | max }}"
+  sp_hi: "{{ [setpoint_ceiling, state_attr(main_climate, 'max_temp') | float(setpoint_ceiling)] | min }}"
+  # Desired forcing target: push a few degrees past the sensed temperature so the
+  # unit runs, clamped to the reachable range, then rounded to the thermostat step.
+  desired_sp_raw: >
+    {{ [[ (sensed - run_offset) if winner_dir == 'cool' else (sensed + run_offset),
+          sp_lo ] | max, sp_hi ] | min }}
+  desired_sp: "{{ ((desired_sp_raw | float(0)) / sp_step) | round(0) * sp_step }}"
+  manual_hard: "{{ setpoint_manual is string and is_state(setpoint_manual, 'on') }}"
+  has_bookkeeping: "{{ last_cmd_setpoint is string and manual_until is string }}"
+  last_cmd_valid: "{{ has_bookkeeping and is_number(states(last_cmd_setpoint)) }}"
+  # Only a genuine manual edit when the unit is ALREADY running in a single
+  # direction. On a transition out of off / heat_cool (the idle band), the
+  # single-mode setpoint is inherited (e.g. the band high), not user-set, so it
+  # must not be mistaken for a manual edit - otherwise force-run backs off and
+  # leaves the unit at the stale (band) target instead of forcing it to run.
+  # The threshold is > 0.9 deg (a real hand nudge), NOT sub-degree: thermostat
+  # rounding / C-F conversion can leave the reported target ~0.5 off what we
+  # commanded, and that must never be mistaken for a manual edit (it would arm
+  # the grace window every cycle and stall force-run all night).
+  # Manual-edit detection/grace is OFF unless explicitly enabled - it has proven
+  # too sensitive to thermostat quirks and would get stuck "leaving the thermostat
+  # alone". When disabled, force-run always manages the setpoint (the hard manual
+  # override toggle still gives deliberate control).
+  manual_edit_detected: >
+    {{ enable_manual_grace and last_cmd_valid and cur_sp_valid
+       and main_dir in ['heat', 'cool']
+       and (cur_sp - (states(last_cmd_setpoint) | float(0))) | abs > 0.9 }}
+  grace_active: >
+    {{ enable_manual_grace and has_bookkeeping
+       and states(manual_until) not in ['unknown', 'unavailable', '']
+       and as_timestamp(states(manual_until), 0) > as_timestamp(now()) }}
+  # Manage the setpoint only when the unit should run, the feature is on, we are
+  # not in hard manual mode, and no valid temps are missing.
+  manage_now: >
+    {{ manage_setpoint and unit_should_run and not manual_hard
+       and sensed_valid }}
+  # --- status / decision summary (for the optional status_helper) ---
+  # A compact, scannable one-liner:  <action + room(s)> · <setpoint> · <mode>
+  # e.g.  "Cooling: Master bedroom · set 68° (hall 70°) · Home Night".
+  status_verb: "{{ 'Cooling' if winner_dir == 'cool' else 'Heating' }}"
+  status_verb_lc: "{{ 'cool' if winner_dir == 'cool' else 'heat' }}"
+  # Rooms currently calling, by direction (friendly names, " demand" stripped).
+  status_cooling_rooms: "{{ (zone_demands | select('is_state', 'cool') | map('state_attr', 'friendly_name') | select('string') | list | join(', ')) | replace(' demand', '') | replace(' Demand', '') }}"
+  status_heating_rooms: "{{ (zone_demands | select('is_state', 'heat') | map('state_attr', 'friendly_name') | select('string') | list | join(', ')) | replace(' demand', '') | replace(' Demand', '') }}"
+  # The room(s) in the winning direction (empty when the cap, not a room, calls).
+  status_win_rooms: >-
+    {{ status_cooling_rooms if winner_dir == 'cool'
+       else status_heating_rooms if winner_dir == 'heat' else '' }}
+  # Headline: the action, merged with the room(s) it is for (no redundant repeat).
+  status_headline: >-
+    {%- if force_off -%}Off
+    {%- elif winner_dir == 'none' and idle_hold -%}Idle · {{ idle_low | round(0) | int }}-{{ idle_high | round(0) | int }}° band
+    {%- elif winner_dir == 'none' -%}Off · no demand
+    {%- elif need_flip and not allow_flip -%}Waiting to {{ status_verb_lc }} · cooldown {{ mins_since_change | round(0) | int }}/{{ min_changeover }}m{% if status_win_rooms %}: {{ status_win_rooms }}{% endif %}
+    {%- else -%}{{ status_verb }}{% if status_win_rooms %}: {{ status_win_rooms }}{% elif cap_active %} · hallway over {{ idle_high | round(0) | int }}°{% endif %}
+    {%- endif -%}
+  # House mode (incl. Home Day vs Home Night).
+  status_mode: >-
+    {% if hm_vacation %}Vacation{% elif want_eco %}Eco Away{% elif not home
+    %}Away{% elif is_night %}Home Night{% else %}Home Day{% endif %}
+  # Status line shown while an away circulation purge is running.
+  purge_status_msg: >-
+    Circulation purge - fan on, all dampers open (mold prevention) - {{ status_mode }}
+  # Terse force-run note (empty unless force-run is actively managing the setpoint).
+  # "set 68° (hall 70°)" means the target was pushed to 68 while the hallway reads
+  # 70 - a lever to keep the unit running, not the room's target.
+  status_sp: >-
+    {%- if manage_setpoint and manual_hard -%}manual setpoint
+    {%- elif manage_now and grace_active -%}manual change - holding
+    {%- elif manage_now -%}set {{ desired_sp | round(0) | int }}° (hall {{ sensed | round(0) | int }}°)
+    {%- endif -%}
+  # Final line: headline · [setpoint] · mode. The write below is skipped when the
+  # message is unchanged, so it updates only when the decision actually changes
+  # (HA tracks last_changed for free - no timestamp needed in the value).
+  status_msg: >-
+    {{ status_headline | trim }}{% if status_sp | trim %} · {{ status_sp | trim }}{% endif %} · {{ status_mode }}
+
+trigger:
+  - platform: state
+    entity_id: !input zone_demands
+    id: demands
+  - platform: state
+    entity_id: !input zone_dampers
+    id: dampers
+  - platform: state
+    entity_id: !input main_climate
+    id: main
+  - platform: state
+    entity_id: !input home_occupied
+    id: presence
+  - platform: homeassistant
+    event: start
+  - platform: time_pattern
+    minutes: "/2"
+    id: resync
+
+condition: []
+
+action:
+  # --- 0. Full manual override / bypass --------------------------------------
+  # While the bypass toggle is on, note it in the status and then STOP - the
+  # coordinator touches nothing (mode, on/off, setpoint, theater damper), leaving
+  # the whole unit under your manual control until you turn it off.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ bypassed and status_helper is string
+                 and states(status_helper) != 'Manual override ON - coordinator not controlling the unit' }}
+        sequence:
+          - service: input_text.set_value
+            target:
+              entity_id: !input status_helper
+            data:
+              value: "Manual override ON - coordinator not controlling the unit"
+  - condition: template
+    value_template: "{{ not bypassed }}"
+
+  # --- 0.5 Away circulation purge --------------------------------------------
+  # While the house is away and nothing is calling, periodically run the blower in
+  # fan-only with every damper open, to move air through all the ducts (stagnant-
+  # air mold / condensation prevention). The coordinator runs the fan and opens
+  # the relief damper; each Room Zone opens its own damper by watching the same
+  # purge-window helper. It yields instantly when a room calls (winner_dir != none
+  # ends eligibility) or when you come home.
+  - choose:
+      # Purge running or due this cycle -> circulate.
+      - conditions:
+          - condition: template
+            value_template: "{{ purge_now }}"
+        sequence:
+          # Stamp a fresh window when starting (written BEFORE switching the fan,
+          # so rooms waking on the mode change already read the new window).
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ purge_start }}"
+                sequence:
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input purge_until
+                    data:
+                      timestamp: "{{ purge_new_until_ts }}"
+          # Every Room Zone (theater included) opens its own damper via the purge
+          # window. Legacy setup only: open a directly-driven relief damper.
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ relief_damper_set }}"
+                sequence:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: !input relief_damper
+          # Run the blower in fan-only (no heating or cooling).
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ main_state != purge_fan_mode }}"
+                sequence:
+                  - service: climate.set_hvac_mode
+                    target:
+                      entity_id: !input main_climate
+                    data:
+                      hvac_mode: "{{ purge_fan_mode }}"
+          # Status line (only when it changed).
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ status_helper is string and states(status_helper) != purge_status_msg }}"
+                sequence:
+                  - service: input_text.set_value
+                    target:
+                      entity_id: !input status_helper
+                    data:
+                      value: "{{ purge_status_msg }}"
+      # A window is open but conditions no longer hold (a room called, or we came
+      # home) -> end the window NOW so the rooms resume normal damper control.
+      - conditions:
+          - condition: template
+            value_template: "{{ purge_running and not purge_now }}"
+        sequence:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input purge_until
+            data:
+              timestamp: "{{ now_ts }}"
+  # If purging this cycle, STOP here - leave the unit in fan-only and skip the
+  # normal direction / eco / setpoint logic below.
+  - condition: template
+    value_template: "{{ not purge_now }}"
+
+  # --- 1. Theater relief valve -----------------------------------------------
+  # Publish whether the theater must open for pressure relief (every room closed,
+  # or too few open while cooling). The theater's Room Zone opens its damper on
+  # this flag. Written only on change.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ theater_relief_helper is string and theater_open and not is_state(theater_relief_helper, 'on') }}"
+        sequence:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input theater_relief_helper
+      - conditions:
+          - condition: template
+            value_template: "{{ theater_relief_helper is string and not theater_open and is_state(theater_relief_helper, 'on') }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input theater_relief_helper
+  # Legacy setup only (no theater Room Zone): drive the relief damper directly.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ relief_damper_set and theater_open }}"
+        sequence:
+          - service: switch.turn_off
+            target:
+              entity_id: !input relief_damper
+      - conditions:
+          - condition: template
+            value_template: "{{ relief_damper_set and not theater_open }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: !input relief_damper
+
+  # --- 2. Eco preset apply / restore -----------------------------------------
+  # Applies while House mode = Away, or presence-away with the eco action.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ want_eco and current_preset != away_preset }}"
+        sequence:
+          - service: climate.set_preset_mode
+            target:
+              entity_id: !input main_climate
+            data:
+              preset_mode: !input away_preset
+      - conditions:
+          - condition: template
+            value_template: "{{ not want_eco and not force_off and current_preset == away_preset }}"
+        sequence:
+          - service: climate.set_preset_mode
+            target:
+              entity_id: !input main_climate
+            data:
+              preset_mode: !input home_preset
+
+  # --- 3. Unit direction / on / off ------------------------------------------
+  - choose:
+      # Forced off: House mode = Vacation, or presence-away with the turn_off
+      # action. Stops the entire unit (including any always-on room).
+      - conditions:
+          - condition: template
+            value_template: "{{ force_off }}"
+        sequence:
+          - condition: template
+            value_template: "{{ main_state != 'off' }}"
+          - service: climate.turn_off
+            target:
+              entity_id: !input main_climate
+      # No room is calling -> idle behavior. Hold a heat_cool safety band, or
+      # (off / cap modes) switch the unit off.
+      - conditions:
+          - condition: template
+            value_template: "{{ winner_dir == 'none' }}"
+        sequence:
+          - choose:
+              # Hold-band mode: keep the unit in heat_cool on the low/high band so
+              # the whole house stays between them (high + low backstop).
+              - conditions:
+                  - condition: template
+                    value_template: "{{ idle_hold }}"
+                sequence:
+                  # Ensure the unit is in heat_cool mode.
+                  - choose:
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ main_state != 'heat_cool' }}"
+                        sequence:
+                          - service: climate.set_hvac_mode
+                            target:
+                              entity_id: !input main_climate
+                            data:
+                              hvac_mode: heat_cool
+                  # Apply the band if it isn't already set.
+                  - choose:
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ not idle_band_set }}"
+                        sequence:
+                          - service: climate.set_temperature
+                            target:
+                              entity_id: !input main_climate
+                            data:
+                              target_temp_low: "{{ idle_low }}"
+                              target_temp_high: "{{ idle_high }}"
+            # Off / cap modes with nothing calling -> switch the unit off.
+            default:
+              - condition: template
+                value_template: "{{ main_state != 'off' }}"
+              - service: climate.turn_off
+                target:
+                  entity_id: !input main_climate
+      # Unit is off and a room is calling -> start it in the winning direction.
+      - conditions:
+          - condition: template
+            value_template: "{{ main_dir == 'off' }}"
+        sequence:
+          - service: climate.set_hvac_mode
+            target:
+              entity_id: !input main_climate
+            data:
+              hvac_mode: "{{ winner_dir }}"
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input changeover_helper
+            data:
+              timestamp: "{{ as_timestamp(now()) }}"
+      # A higher-priority room wants the opposite direction and the flip is
+      # allowed (lockout passed, or nothing still calls the current direction).
+      - conditions:
+          - condition: template
+            value_template: "{{ need_flip and allow_flip }}"
+        sequence:
+          - service: climate.set_hvac_mode
+            target:
+              entity_id: !input main_climate
+            data:
+              hvac_mode: "{{ winner_dir }}"
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input changeover_helper
+            data:
+              timestamp: "{{ as_timestamp(now()) }}"
+    # else: winner_dir == main_dir (already correct), or a flip is needed but
+    # still locked out - hold the current direction.
+    default: []
+
+  # --- 4. Setpoint force-run (optional) --------------------------------------
+  # Make sure the central thermostat's target is aggressive enough (relative to
+  # the hallway it senses) that the unit actually runs in the winning direction.
+  - choose:
+      # Feature off, hard manual mode, or unit shouldn't run -> do nothing.
+      - conditions:
+          - condition: template
+            value_template: "{{ not manage_now }}"
+        sequence: []
+      # A manual edit was just detected -> respect it: start the grace window and
+      # adopt the manual value as the new baseline. Don't change the setpoint.
+      # SAFEGUARD: only arm when NOT already in grace, so a burst of edits (or
+      # intermittent noise) can't keep extending grace - it stays a single fixed
+      # window. (The root protection against false detections is the rounded
+      # target + the >0.9 deg threshold above.)
+      - conditions:
+          - condition: template
+            value_template: "{{ manual_edit_detected and has_bookkeeping and not grace_active }}"
+        sequence:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input manual_until
+            data:
+              timestamp: "{{ as_timestamp(now()) + (manual_grace | float(0)) * 60 }}"
+          - service: input_number.set_value
+            target:
+              entity_id: !input last_cmd_setpoint
+            data:
+              value: "{{ cur_sp }}"
+      # Inside the manual grace window -> leave the setpoint alone.
+      - conditions:
+          - condition: template
+            value_template: "{{ grace_active }}"
+        sequence: []
+      # Manage: if the current target isn't already the forcing value, set it.
+      - conditions:
+          - condition: template
+            value_template: "{{ (not cur_sp_valid) or ((cur_sp - desired_sp) | abs > 0.5) }}"
+        sequence:
+          - service: climate.set_temperature
+            target:
+              entity_id: !input main_climate
+            data:
+              temperature: "{{ desired_sp }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ has_bookkeeping }}"
+                sequence:
+                  - service: input_number.set_value
+                    target:
+                      entity_id: !input last_cmd_setpoint
+                    data:
+                      value: "{{ desired_sp }}"
+      # Already at the forcing target (nothing to do): reconcile the baseline to
+      # what the thermostat actually reports, so any residual gap (stepping,
+      # clamping, C-F rounding) never accumulates into a phantom "manual edit".
+      - conditions:
+          - condition: template
+            value_template: "{{ has_bookkeeping and cur_sp_valid }}"
+        sequence:
+          - service: input_number.set_value
+            target:
+              entity_id: !input last_cmd_setpoint
+            data:
+              value: "{{ cur_sp }}"
+    default: []
+
+  # --- 5. Status / decision output (optional) --------------------------------
+  # Publish a one-line summary of what this run decided, for observability. The
+  # status variables are rendered at run start, so this reflects the decision.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ status_helper is string and states(status_helper) != status_msg }}"
+        sequence:
+          - service: input_text.set_value
+            target:
+              entity_id: !input status_helper
+            data:
+              value: "{{ status_msg }}"
+
+  # --- 7. Cooling-relief flag (optional) -------------------------------------
+  # Turn the relief flag ON while cooling with fewer than the minimum rooms
+  # actually calling, so a designated relief room (e.g. the server) rides along
+  # ONLY when it's genuinely needed as the extra open zone - keeping the full
+  # airflow on the bedrooms until one of them reaches temperature. On/off only
+  # when it changes, so the helper doesn't churn.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ cool_relief_helper is string and cool_relief_needed and not is_state(cool_relief_helper, 'on') }}"
+        sequence:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input cool_relief_helper
+      - conditions:
+          - condition: template
+            value_template: "{{ cool_relief_helper is string and not cool_relief_needed and is_state(cool_relief_helper, 'on') }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input cool_relief_helper

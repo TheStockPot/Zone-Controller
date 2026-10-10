@@ -1,0 +1,811 @@
+blueprint:
+  name: AryaNakh's Zone Controller - Room Zone (v0.3)
+  author: AryaNakh
+  description: >
+    Per-room damper control for a ducted HVAC zoning system. Instantiate once per
+    room (nursery, master bedroom, server room, theater / guest room). The theater
+    uses its guest-mode toggle as its Enable toggle, and opens as the pressure-
+    relief valve whenever the Coordinator's relief flag (see "Force open while
+    this is on") is on - even while guest mode is off.
+
+    What it does:
+      1. Reads the room's temperature sensor and compares it to low/high
+         setpoints (input_number helpers) to compute a *raw demand*:
+         heat / cool / none - independent of what the unit is doing right now.
+      2. Publishes that raw demand to an input_text helper so the Coordinator can
+         arbitrate direction between rooms by priority.
+      3. Opens this room's damper only when the room is enabled, allowed to run,
+         and its demand matches the direction the unit is currently delivering.
+
+    IMPORTANT - damper polarity: the dampers are normally-open and the switch is
+    INVERTED. `off` = damper OPEN (air flows), `on` = damper CLOSED (air cut off).
+    So this blueprint calls switch.turn_off to give a room air and switch.turn_on
+    to cut it off. On power loss the dampers spring open (intended failsafe).
+
+    Zone modes:
+      - standard    : eligible whenever out of band (e.g. nursery)
+      - always_on   : never gated by occupancy (e.g. server room)
+      - occupancy   : eligible only while the occupancy sensor is 'on'
+
+    The Enable toggle is a hard master switch: while off, the room publishes no
+    demand and its damper is closed (unless a purge or the force-open flag opens
+    it).
+  domain: automation
+  source_url: https://github.com/aryanakh/zone-controller/blob/main/blueprints/automation/zone_controller/room_zone.yaml
+  input:
+    control_section:
+      name: Control
+      icon: mdi:toggle-switch
+      collapsed: false
+      input:
+        enabled:
+          name: Room enable toggle
+          description: >
+            An input_boolean that turns this room on/off. While off the room
+            publishes no demand and its damper is forced closed.
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        demand_helper:
+          name: Demand helper (input_text)
+          description: >
+            An input_text this room writes its raw demand to (heat / cool / none).
+            The Coordinator reads these, in priority order, to decide the unit's
+            direction. Each room needs its own dedicated helper.
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        status_helper:
+          name: Room status output (input_text, optional)
+          description: >
+            Optional input_text this room writes a plain-English explanation of
+            what it is doing and why to (its temperature vs its effective target,
+            day/sleep, whether it's yielding or disabled). Purely diagnostic; add
+            it to a dashboard to see why each room is or isn't calling.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        bypass:
+          name: Full manual override / bypass (optional)
+          description: >
+            An input_boolean. While ON, this room does NOTHING - it stops driving
+            its damper (and publishing demand), so you have full manual control of
+            the damper until you turn it off. Use the SAME toggle here and in the
+            Coordinator so the whole system stands down together.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+
+    sensors_section:
+      name: Sensors & Entities
+      icon: mdi:thermometer
+      collapsed: false
+      input:
+        room_temp_sensor:
+          name: Room temperature sensor
+          description: The sensor providing this room's current temperature.
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: temperature
+        damper_switches:
+          name: Damper switch(es)
+          description: >
+            The switch entity (or entities) for this room's damper(s). A room may
+            have more than one damper (e.g. the master bedroom). They are driven
+            together. Remember: off = open, on = closed.
+          selector:
+            target:
+              entity:
+                - domain: switch
+        main_climate:
+          name: Main HVAC climate entity
+          description: >
+            The upstairs unit's climate entity. Read only - used to know the
+            direction the unit is currently delivering (heat / cool / heat_cool /
+            off). The room opens its damper only when its demand matches that
+            direction; the Coordinator is what sets the direction.
+          selector:
+            entity:
+              filter:
+                - domain: climate
+
+    setpoints_section:
+      name: Setpoints
+      icon: mdi:target
+      collapsed: false
+      input:
+        cool_setpoint:
+          name: Cool setpoint (cool above this)
+          description: input_number helper holding the temperature above which the room asks for cooling.
+          selector:
+            entity:
+              filter:
+                - domain: input_number
+        enable_cool:
+          name: Enable cooling
+          description: Allow this room to request cooling.
+          default: true
+          selector:
+            boolean:
+        heat_setpoint:
+          name: Heat setpoint (heat below this)
+          description: >
+            Optional input_number helper holding the temperature below which the
+            room asks for heating. Leave unset for cool-only rooms (server room,
+            master bedroom). Keep it at least ~2° below the cool setpoint so the
+            room can't be cooled into needing heat.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_number
+        enable_heat:
+          name: Enable heating
+          description: Allow this room to request heating. Turn off for cool-only rooms.
+          default: true
+          selector:
+            boolean:
+        hysteresis:
+          name: Hysteresis (°)
+          description: >
+            Half of the anti-chatter deadband, applied on each side of the
+            setpoint. Cooling engages above (cool setpoint + this) and does not
+            release until the room drops below (cool setpoint - this); heating is
+            mirrored. So a room settles within a band of twice this value around
+            the setpoint. Use a small value (~0.3) for tight rooms like a
+            nursery; 0 gives a bare threshold (may chatter).
+          default: 0.5
+          selector:
+            number:
+              min: 0.0
+              max: 3.0
+              step: 0.1
+              unit_of_measurement: "°"
+              mode: box
+
+    mode_section:
+      name: Zone Mode
+      icon: mdi:home-thermometer
+      collapsed: false
+      input:
+        zone_mode:
+          name: Zone mode
+          description: How this room decides whether it is allowed to be conditioned.
+          default: standard
+          selector:
+            select:
+              options:
+                - label: Standard (always eligible, follows setpoints)
+                  value: standard
+                - label: Always on (never gated - e.g. server room)
+                  value: always_on
+                - label: Occupancy (only when occupied)
+                  value: occupancy
+        occupancy_sensor:
+          name: Occupancy sensor
+          description: Required for 'occupancy' mode. The room is only conditioned while this is 'on'.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: binary_sensor
+
+    sleep_section:
+      name: Sleep Mode Override (optional)
+      icon: mdi:power-sleep
+      collapsed: true
+      input:
+        sleep_boolean:
+          name: Sleep mode boolean
+          description: >
+            Optional input_boolean. While on, the room uses the sleep cool
+            setpoint instead of its normal cool setpoint (e.g. master bedroom
+            drops from 75 to 68 at night). This is a manual "do it now" override;
+            the scheduled window below applies the same setpoint automatically.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        sleep_cool_setpoint:
+          name: Sleep / pre-cool cool setpoint
+          description: >
+            Optional input_number used as the cool setpoint while Sleep mode is
+            on OR while inside the scheduled activation window below. Set this to
+            enable evening pre-cool (e.g. master bedroom targets 68 from 8pm).
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_number
+        boost_boolean:
+          name: Comfort boost toggle (optional)
+          description: >
+            Optional input_boolean for a temporary "cool it down now" override -
+            e.g. flip it on while someone is using the master bedroom during the
+            day. While on, the room uses its sleep / pre-cool cool setpoint (the
+            colder target above) AND stays eligible even if it's occupancy-gated,
+            so it cools to that target regardless of the time of day. Turn it off
+            to return to the normal day behavior. Independent of the whole-house
+            night label - this only affects this room.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+
+    away_section:
+      name: Away Setpoint Override (optional)
+      icon: mdi:home-export-outline
+      collapsed: true
+      input:
+        home_occupied_ref:
+          name: Home-occupied toggle (for away setpoint)
+          description: >
+            Optional input_boolean - point it at your home-occupied toggle. While
+            it is OFF (nobody home) this room uses the away cool setpoint below and
+            stays eligible even if it's an occupancy-gated room, so it can't bake
+            while you're out. Needs the away setpoint below to take effect.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        away_cool_setpoint:
+          name: Away cool setpoint
+          description: >
+            Optional input_number - the cool setpoint used while away (home toggle
+            off). Set it warmer than the day setpoint to save power, but low enough
+            that the room never bakes (e.g. 75). Takes precedence over day/sleep.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_number
+
+    relief_section:
+      name: Cooling Ride-Along (optional)
+      icon: mdi:air-filter
+      collapsed: true
+      input:
+        cool_ride_along:
+          name: Ride along while cooling (pressure relief)
+          description: >
+            While the unit is COOLING, keep this room's damper open even when it
+            isn't calling, so it provides a second airflow path and the system
+            never runs through a single small zone. Best on a room that always
+            benefits from cooling (e.g. a server room), so relief isn't wasted on
+            the theater. It never turns the unit on by itself and never heats;
+            it only rides along on cooling the unit is already doing, down to the
+            floor below.
+          default: false
+          selector:
+            boolean:
+        cool_ride_along_margin:
+          name: Ride-along floor below cool setpoint (deg)
+          description: >
+            How far below its cool setpoint this room may be cooled while riding
+            along. It stops taking ride-along air once it drops this far below its
+            setpoint, so it can't be frozen. Default 4.
+          default: 4.0
+          selector:
+            number:
+              min: 0.0
+              max: 20.0
+              step: 0.5
+              unit_of_measurement: deg
+              mode: box
+        ride_along_gate:
+          name: Ride along only while this is on (optional)
+          description: >
+            Optional input_boolean - point it at the Coordinator's "Cooling-relief-
+            needed output" helper. When set, this room rides along ONLY while that
+            helper is on (i.e. the coordinator says an extra open zone is actually
+            needed) - so it stays closed while enough higher-priority rooms are
+            already calling, keeping the full airflow on them until one reaches
+            temperature. Leave unset to ride along on every cooling cycle.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+
+    purge_section:
+      name: Away Circulation Purge (optional)
+      icon: mdi:fan-alert
+      collapsed: true
+      input:
+        purge_until:
+          name: Circulation purge window (input_datetime)
+          description: >
+            Point this at the SAME "Purge-window helper" input_datetime the
+            Coordinator uses. While the coordinator is running an away circulation
+            purge, this room opens its damper (regardless of demand or enable) so
+            air moves through its duct too - discouraging stagnant-air mold /
+            condensation. Leave unset to opt this room out of purges.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+        force_open_boolean:
+          name: Force open while this is on (optional)
+          description: >
+            Optional input_boolean. While it is on, this room's damper is held
+            OPEN regardless of demand or the Enable toggle. Use it on the theater,
+            pointed at the Coordinator's "Theater relief output" helper, so the
+            theater still acts as the last-resort pressure-relief valve even when
+            guest mode (its Enable toggle) is off. Leave unset on other rooms.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+
+    schedule_section:
+      name: Scheduled Activation (optional)
+      icon: mdi:clock-outline
+      collapsed: true
+      input:
+        active_after:
+          name: Active after (time of day)
+          description: >
+            Optional. Makes the room eligible for conditioning during a daily
+            window, on top of its zone mode, AND (when a sleep/pre-cool setpoint
+            is configured) switches the room to that colder target for the
+            window. Example: set to 20:00 so the master bedroom starts
+            pre-cooling toward its night setpoint around 8pm. Set BOTH after and
+            until to use this; the window may cross midnight (e.g. 20:00 -> 07:00).
+          default: {}
+          selector:
+            time:
+        active_until:
+          name: Active until (time of day)
+          description: End of the daily active window. Set together with "Active after".
+          default: {}
+          selector:
+            time:
+        schedule_requires_home:
+          name: Schedule requires house occupied
+          description: >
+            Optional input_boolean (e.g. the house occupied toggle). When set, the
+            scheduled window only activates the room while this is on - i.e. only
+            begin pre-cooling if the house is occupied.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        early_start_boolean:
+          name: Start the window earlier when this is on (optional)
+          description: >
+            Optional input_boolean - e.g. the theater guest-room mode toggle. While
+            it is on, this room's scheduled window (its "Active after" time, and
+            therefore its pre-cool) begins "Early-start minutes" sooner. Useful
+            when an extra zone (the guest theater) reduces available airflow, so
+            cooling needs a head start to still hit targets on time. Only affects
+            the window start; requires a schedule to be set above.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_boolean
+        early_start_minutes:
+          name: Early-start minutes
+          description: How much sooner to begin the window when the toggle above is on.
+          default: 60
+          selector:
+            number:
+              min: 0
+              max: 240
+              step: 15
+              unit_of_measurement: min
+              mode: box
+
+    priority_section:
+      name: Priority Yield (optional)
+      icon: mdi:priority-high
+      collapsed: true
+      input:
+        priority_demand:
+          name: Yield to this higher-priority room's demand helper
+          description: >
+            Optional. Point this at a higher-priority room's demand helper. While
+            that room is actively being served (it is calling AND the unit is
+            delivering its direction), THIS room CLOSES its damper so airflow is
+            concentrated on the priority room, then reopens when it stops calling.
+            This room still publishes its own demand (so the unit keeps running for
+            it) - only its damper yields. Leave unset for normal behavior. Do NOT
+            set it on a must-run room (e.g. a server room).
+            TIP: to yield ONLY when the priority room is in an extreme state (e.g.
+            a nursery far above target), point this at that room's URGENT-demand
+            helper (below) instead of its normal demand helper - then this room
+            yields only while the priority room is urgent and reopens as soon as it
+            recovers to within its urgent margin, while both keep calling.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        priority_demand_extra:
+          name: Also yield to these demand helpers (optional)
+          description: >
+            Optional. More higher-priority demand helpers to yield to, on top of
+            the one above. This room closes its damper while ANY of them is being
+            served. Use it on the theater (lowest priority) with the nursery and
+            master demand helpers, so the guest room is honored last.
+          default: {}
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: input_text
+        yield_day_only:
+          name: Only yield during the day (not at night)
+          description: >
+            When on, this room SUSPENDS its priority yield while it is on its
+            night / sleep setpoint (sleep toggle on, or inside its pre-cool window)
+            - so at night it keeps its damper open and serves itself (and provides
+            the relief zone) instead of yielding. Use this on the master bedroom so
+            it focuses air on the nursery during the day, but at night stays open
+            as the relief path until it reaches its own sleep target. No effect if
+            no yield is configured above.
+          default: false
+          selector:
+            boolean:
+        urgent_helper:
+          name: Urgent-demand output for THIS room (input_text, optional)
+          description: >
+            Optional. When THIS room is more than "Urgent margin" past its
+            setpoint, its demand direction (heat/cool) is published here; otherwise
+            'none'. A lower-priority room can point its "Yield to..." at this helper
+            so it only yields to this room in extreme cases. Set this on the
+            high-priority room (e.g. the nursery), not on the room that yields.
+          default: {}
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        urgent_margin:
+          name: Urgent margin (deg)
+          description: >
+            How many degrees past the setpoint counts as "urgent" for the
+            urgent-demand output. Example: setpoint 70, margin 2 -> urgent while
+            cooling and the room is above 72; it clears (with hysteresis) as the
+            room recovers toward 72.
+          default: 2.0
+          selector:
+            number:
+              min: 0.0
+              max: 15.0
+              step: 0.5
+              unit_of_measurement: deg
+              mode: box
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  enabled: !input enabled
+  demand_helper: !input demand_helper
+  status_helper: !input status_helper
+  bypass: !input bypass
+  bypassed: "{{ bypass is string and is_state(bypass, 'on') }}"
+  zone_mode: !input zone_mode
+  occupancy_sensor: !input occupancy_sensor
+  room_temp_sensor: !input room_temp_sensor
+  main_climate: !input main_climate
+  cool_setpoint: !input cool_setpoint
+  heat_setpoint: !input heat_setpoint
+  enable_cool: !input enable_cool
+  enable_heat: !input enable_heat
+  hysteresis: !input hysteresis
+  sleep_boolean: !input sleep_boolean
+  sleep_cool_setpoint: !input sleep_cool_setpoint
+  boost_boolean: !input boost_boolean
+  home_occupied_ref: !input home_occupied_ref
+  away_cool_setpoint: !input away_cool_setpoint
+  cool_ride_along: !input cool_ride_along
+  cool_ride_along_margin: !input cool_ride_along_margin
+  ride_along_gate: !input ride_along_gate
+  purge_until: !input purge_until
+  force_open_boolean: !input force_open_boolean
+  active_after: !input active_after
+  active_until: !input active_until
+  schedule_requires_home: !input schedule_requires_home
+  early_start_boolean: !input early_start_boolean
+  early_start_minutes: !input early_start_minutes
+  priority_demand: !input priority_demand
+  priority_demand_extra: !input priority_demand_extra
+  yield_day_only: !input yield_day_only
+  urgent_helper: !input urgent_helper
+  urgent_margin: !input urgent_margin
+  # --- derived state ---
+  temp_raw: "{{ states(room_temp_sensor) }}"
+  temp_valid: "{{ is_number(temp_raw) }}"
+  temp: "{{ temp_raw | float(0) }}"
+  main_mode: "{{ states(main_climate) }}"
+  enabled_on: "{{ is_state(enabled, 'on') }}"
+  # Optional daily schedule window (may cross midnight). Both times must be set.
+  # Computed early because it also drives the pre-cool setpoint below.
+  has_schedule: "{{ active_after is string and active_until is string }}"
+  now_hms: "{{ now().strftime('%H:%M:%S') }}"
+  # Effective window start - shifted earlier by early_start_minutes when the
+  # early-start toggle is on (e.g. theater guest mode), so pre-cool gets a head
+  # start. Handles wrapping past midnight (the in_window logic below re-checks
+  # crossing against this shifted start).
+  early_start_on: "{{ early_start_boolean is string and is_state(early_start_boolean, 'on') }}"
+  eff_after: >
+    {{ (as_timestamp(today_at(active_after)) - (early_start_minutes | float(0)) * 60)
+       | timestamp_custom('%H:%M:%S') if (has_schedule and early_start_on)
+       else active_after }}
+  in_window: >
+    {{ false if not has_schedule
+       else (eff_after <= now_hms < active_until)
+         if (eff_after <= active_until)
+       else (now_hms >= eff_after or now_hms < active_until) }}
+  schedule_home_ok: >
+    {{ schedule_requires_home is not string
+       or is_state(schedule_requires_home, 'on') }}
+  schedule_active: "{{ has_schedule and in_window and schedule_home_ok }}"
+  # Effective cool setpoint. Use the sleep/pre-cool setpoint (when configured)
+  # whenever Sleep mode is on, we are inside the scheduled window, OR the comfort
+  # boost toggle is on - so the evening window pre-cools toward the night target,
+  # and a daytime boost drops the room to that same colder target on demand.
+  # Optional entity inputs are a plain string when set and an empty dict when
+  # unset, so `is string` reliably detects "configured".
+  boost_active: "{{ boost_boolean is string and is_state(boost_boolean, 'on') }}"
+  use_night_sp: >
+    {{ sleep_cool_setpoint is string and (
+         (sleep_boolean is string and is_state(sleep_boolean, 'on'))
+         or schedule_active or boost_active ) }}
+  # Away: while the home toggle is OFF and an away setpoint is configured, use it
+  # (takes precedence over day/sleep) and keep the room eligible even if
+  # occupancy-gated, so it can't bake while nobody is home.
+  away_active: >
+    {{ home_occupied_ref is string and is_state(home_occupied_ref, 'off')
+       and away_cool_setpoint is string }}
+  # The active cool-setpoint entity: away > sleep/pre-cool > day.
+  cool_sp_src: >
+    {{ away_cool_setpoint if away_active
+       else sleep_cool_setpoint if use_night_sp
+       else cool_setpoint }}
+  # WATCHDOG: only trust the cool setpoint when it is a real number. If the helper
+  # is unavailable/unknown, do NOT fall back to 0 (that would make every reading
+  # look "too hot" and demand cooling forever, even far below the real setpoint).
+  cool_sp_valid: "{{ is_number(states(cool_sp_src)) }}"
+  cool_sp: "{{ states(cool_sp_src) | float(0) }}"
+  has_heat_sp: "{{ heat_setpoint is string and is_number(states(heat_setpoint)) }}"
+  heat_sp: "{{ states(heat_setpoint) | float(0) if has_heat_sp else 0 }}"
+  # Is this room allowed to run right now (mode gate)?
+  mode_active: >
+    {{ true if zone_mode == 'always_on'
+       else (occupancy_sensor is string and is_state(occupancy_sensor, 'on'))
+         if zone_mode == 'occupancy'
+       else true }}
+  # Hard gate: enabled AND (mode-eligible OR inside the scheduled window OR away OR
+  # comfort boost - away keeps the room eligible so it can be capped at its away
+  # setpoint; boost keeps it eligible so it cools to the sleep target on demand).
+  active: "{{ enabled_on and (mode_active or schedule_active or away_active or boost_active) }}"
+  # Raw directional demand with a true two-sided deadband, independent of the
+  # unit's mode. The room's own last-published demand (in demand_helper) is the
+  # state memory: engage above cool_sp+hyst, then hold 'cool' until temp drops
+  # below cool_sp-hyst (mirrored for heat). hysteresis=0 => a bare threshold.
+  was_cool: "{{ is_state(demand_helper, 'cool') }}"
+  was_heat: "{{ is_state(demand_helper, 'heat') }}"
+  raw_want_cool: >
+    {{ enable_cool and temp_valid and cool_sp_valid and (
+         temp > (cool_sp + hysteresis)
+         or (was_cool and temp > (cool_sp - hysteresis)) ) }}
+  raw_want_heat: >
+    {{ enable_heat and temp_valid and has_heat_sp and (
+         temp < (heat_sp - hysteresis)
+         or (was_heat and temp < (heat_sp + hysteresis)) ) }}
+  raw_demand: >
+    {{ 'cool' if (active and raw_want_cool)
+       else 'heat' if (active and raw_want_heat)
+       else 'none' }}
+  # Urgent demand: this room's direction, but only while it is MORE than
+  # urgent_margin past its setpoint (engage), holding until it recovers to within
+  # urgent_margin - hysteresis (release). Published for lower-priority rooms to
+  # yield to only in extreme cases.
+  was_urgent_cool: "{{ urgent_helper is string and is_state(urgent_helper, 'cool') }}"
+  was_urgent_heat: "{{ urgent_helper is string and is_state(urgent_helper, 'heat') }}"
+  urgent_want_cool: >
+    {{ enable_cool and temp_valid and cool_sp_valid and (
+         temp > (cool_sp + urgent_margin)
+         or (was_urgent_cool and temp > (cool_sp + urgent_margin - hysteresis)) ) }}
+  urgent_want_heat: >
+    {{ enable_heat and temp_valid and has_heat_sp and (
+         temp < (heat_sp - urgent_margin)
+         or (was_urgent_heat and temp < (heat_sp - urgent_margin + hysteresis)) ) }}
+  urgent_demand: >
+    {{ 'cool' if (active and urgent_want_cool)
+       else 'heat' if (active and urgent_want_heat)
+       else 'none' }}
+  # Priority yield: is a higher-priority room actively being served right now
+  # (it is calling AND the unit is delivering its direction)? If so, this room
+  # closes its damper to concentrate airflow on the priority room. This only ever
+  # fires while the priority room is actually getting air, so we never yield
+  # during a compressor cooldown while the unit is still serving THIS room.
+  # All helpers this room yields to: the main one plus any extras (unset optional
+  # inputs are an empty dict, so they contribute nothing).
+  priority_list: >
+    {{ ([priority_demand] if priority_demand is string else [])
+       + (priority_demand_extra if (priority_demand_extra is not mapping
+                                    and priority_demand_extra is not string)
+          else ([priority_demand_extra] if priority_demand_extra is string else [])) }}
+  # Day-only yield: suspend the yield while this room is on its night/sleep
+  # setpoint, so at night it keeps its damper open (serving itself + relief)
+  # instead of yielding to the priority room.
+  yield_suspended: "{{ yield_day_only and use_night_sp }}"
+  # Yield while ANY listed higher-priority room is calling in the direction the
+  # unit is delivering.
+  priority_served: >
+    {{ not yield_suspended and (
+         (main_mode in ['cool', 'heat_cool']
+          and priority_list | select('is_state', 'cool') | list | count > 0)
+         or (main_mode in ['heat', 'heat_cool']
+          and priority_list | select('is_state', 'heat') | list | count > 0)) }}
+  # Open only when the room's demand matches the direction the unit delivers AND
+  # no higher-priority room is currently being served (see priority yield above).
+  # Cooling ride-along: while the unit is already cooling, keep this room open for
+  # pressure relief even when it isn't calling - down to a floor so it can't be
+  # frozen. It never turns the unit on (raw_demand is still published normally).
+  # If a ride-along gate is configured, only ride along while it is on (i.e. the
+  # coordinator says an extra open zone is actually needed) - so the room stays
+  # closed while enough higher-priority rooms already provide the open zones.
+  ride_along_allowed: >
+    {{ ride_along_gate is not string or is_state(ride_along_gate, 'on') }}
+  cool_riding: >
+    {{ cool_ride_along and ride_along_allowed and enable_cool and cool_sp_valid
+       and main_mode in ['cool', 'heat_cool']
+       and temp_valid and temp > (cool_sp - cool_ride_along_margin) }}
+  # Away circulation purge: while the coordinator's purge window is open, force
+  # this room's damper OPEN so the fan can move air through its duct (mold /
+  # condensation prevention), regardless of demand or enable state.
+  purging: >
+    {{ purge_until is string
+       and as_timestamp(now()) < as_timestamp(states(purge_until), 0) }}
+  # Force-open flag (e.g. the coordinator's theater relief output): hold the
+  # damper open regardless of demand or enable, as the pressure-relief valve.
+  forced_open: "{{ force_open_boolean is string and is_state(force_open_boolean, 'on') }}"
+  should_open: >
+    {{ purging or forced_open or (active and not priority_served and (
+         (raw_demand == 'cool' and main_mode in ['cool', 'heat_cool']) or
+         (raw_demand == 'heat' and main_mode in ['heat', 'heat_cool']) or
+         cool_riding
+       )) }}
+  # Which setpoint set is in effect (for the status line).
+  sp_tag: "{{ 'away' if away_active else 'boost' if boost_active else 'sleep' if use_night_sp else 'day' }}"
+  # Plain-English explanation of what this room is doing and why (for status_helper).
+  room_status: >-
+    {%- if bypassed -%}Manual override ON - not controlling this damper
+    {%- elif purging -%}Circulation purge - damper open, fan circulating (mold prevention){% if temp_valid %} - {{ temp | round(1) }}°{% endif %}
+    {%- elif forced_open and not (enabled_on and active and raw_demand in ['cool', 'heat']) -%}Relief valve open (pressure relief){% if temp_valid %} - {{ temp | round(1) }}°{% endif %}
+    {%- elif not enabled_on -%}Off (disabled)
+    {%- elif not temp_valid -%}No temperature reading
+    {%- elif not active -%}Idle - {{ temp | round(1) }}° (not eligible: occupancy/schedule)
+    {%- elif raw_demand == 'cool' -%}Cooling{{ ' (relief valve open)' if forced_open else ' (yielding to priority)' if priority_served else '' }} - {{ temp | round(1) }}° vs {{ cool_sp | round(1) }}° target ({{ sp_tag }})
+    {%- elif raw_demand == 'heat' -%}Heating{{ ' (relief valve open)' if forced_open else ' (yielding to priority)' if priority_served else '' }} - {{ temp | round(1) }}° vs {{ heat_sp | round(1) }}° target
+    {%- elif cool_riding and not priority_served -%}Riding along (pressure relief) - {{ temp | round(1) }}°, taking cool air down to {{ (cool_sp - cool_ride_along_margin) | round(1) }}°
+    {%- else -%}Idle - {{ temp | round(1) }}° (cool above {{ cool_sp | round(1) }}°{% if has_heat_sp %}, heat below {{ heat_sp | round(1) }}°{% endif %}) ({{ sp_tag }})
+    {%- endif -%}
+
+# Optional toggles can't be plain state triggers (an unset input is an empty dict),
+# so expose them as trigger variables and watch them with guarded template
+# triggers - an unset input renders false and never fires. This makes the room
+# react immediately to boost, the relief flag and the ride-along gate instead of
+# waiting for the 5-min resync.
+trigger_variables:
+  t_boost: !input boost_boolean
+  t_force_open: !input force_open_boolean
+  t_ride_gate: !input ride_along_gate
+
+trigger:
+  - platform: template
+    value_template: "{{ t_boost is string and is_state(t_boost, 'on') }}"
+    id: boost_on
+  - platform: template
+    value_template: "{{ t_boost is string and is_state(t_boost, 'off') }}"
+    id: boost_off
+  - platform: template
+    value_template: "{{ t_force_open is string and is_state(t_force_open, 'on') }}"
+    id: force_open_on
+  - platform: template
+    value_template: "{{ t_force_open is string and is_state(t_force_open, 'off') }}"
+    id: force_open_off
+  - platform: template
+    value_template: "{{ t_ride_gate is string and is_state(t_ride_gate, 'on') }}"
+    id: ride_gate_on
+  - platform: template
+    value_template: "{{ t_ride_gate is string and is_state(t_ride_gate, 'off') }}"
+    id: ride_gate_off
+  - platform: state
+    entity_id: !input room_temp_sensor
+    id: temp
+  - platform: state
+    entity_id: !input main_climate
+    id: main
+  - platform: state
+    entity_id: !input enabled
+    id: enabled
+  - platform: homeassistant
+    event: start
+  - platform: time_pattern
+    minutes: "/5"
+    id: resync
+
+condition: []
+
+action:
+  # Full manual override / bypass: note it in the room status, then STOP - the
+  # room stops driving its damper and publishing demand, leaving the damper under
+  # your manual control until the toggle is turned off.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ bypassed and status_helper is string and states(status_helper) != room_status }}"
+        sequence:
+          - service: input_text.set_value
+            target:
+              entity_id: !input status_helper
+            data:
+              value: "{{ room_status }}"
+  - condition: template
+    value_template: "{{ not bypassed }}"
+
+  # WATCHDOG: always publish (no early abort). On an invalid/missing temperature
+  # raw_demand computes to 'none' (the want_* checks require a valid temp), so a
+  # dead or unavailable sensor fails SAFE to 'none' and closes the damper instead
+  # of freezing the last demand (e.g. a stale 'cool') and cooling a room forever.
+  - service: input_text.set_value
+    target:
+      entity_id: !input demand_helper
+    data:
+      value: "{{ raw_demand }}"
+
+  # Publish the urgent demand (only when a helper is configured and it changed),
+  # so lower-priority rooms can yield to this one only in extreme cases.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ urgent_helper is string and states(urgent_helper) != urgent_demand }}"
+        sequence:
+          - service: input_text.set_value
+            target:
+              entity_id: !input urgent_helper
+            data:
+              value: "{{ urgent_demand }}"
+
+  # Publish this room's plain-English status (only when set and changed).
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ status_helper is string and states(status_helper) != room_status }}"
+        sequence:
+          - service: input_text.set_value
+            target:
+              entity_id: !input status_helper
+            data:
+              value: "{{ room_status }}"
+
+  # Drive the damper. OPEN => switch OFF, CLOSED => switch ON (inverted).
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ should_open }}"
+        sequence:
+          - service: switch.turn_off
+            target: !input damper_switches
+    default:
+      - service: switch.turn_on
+        target: !input damper_switches

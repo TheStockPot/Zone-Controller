@@ -1,13 +1,13 @@
+# Basic Config
 esphome:
-  name: zone-controller
-  friendly_name: Zone Controller
-  comment: "ESP32 based zone controller"
-  project:
-    name: "The Stock Pot.Zone Controller"
-    version: "1.0.0"
+  name: hvac-zone-controller
+  friendly_name: HVAC Zone Controller
+  comment: "Kincony Relay Board - KC868-a8"
 
 esp32:
-  board: esp32dev
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
 
 i2c:
   sda: 4
@@ -15,30 +15,31 @@ i2c:
   scan: true
   id: bus_a
 
-## Ethernet wasn't working correctly, so until I have time to fix it (perhaps never) my controller is running on wifi :( 
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk_mode: GPIO17_OUT
+  phy_addr: 0
 
-wifi:
-  ssid: "my_wifi"
-  password: "my_password"
-  power_save_mode: NONE
+  # Optional manual IP
+  manual_ip:
+    static_ip: #SET_IP
+    gateway: #SET_GATEWAY
+    subnet: 255.255.255.0 
 
-logger:
-
-api:
-
-ota:
-  platform: esphome
 
 pcf8574:
-  - id: 'pcf8574_hub_out_1'
+  - id: "pcf8574_hub_out_1" # for output channel 1-8
     address: 0x24
-  - id: 'pcf8574_hub_in_1'
+
+  - id: "pcf8574_hub_in_1" # for input channel 1-8
     address: 0x22
 
+# Individual outputs
 switch:
   - platform: gpio
-    name: "N/A"
-    internal: true
+    name: "a8-relay1"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 0
@@ -46,9 +47,7 @@ switch:
       inverted: true
 
   - platform: gpio
-    name: "Nursery"
-    id: nursery_switch
-    internal: true
+    name: "a8-relay2"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 1
@@ -56,9 +55,7 @@ switch:
       inverted: true
 
   - platform: gpio
-    name: "Living"
-    id: living_switch
-    internal: true
+    name: "a8-relay3"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 2
@@ -66,9 +63,7 @@ switch:
       inverted: true
 
   - platform: gpio
-    name: "Dining"
-    id: dining_switch
-    internal: true
+    name: "a8-relay4"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 3
@@ -76,9 +71,7 @@ switch:
       inverted: true
 
   - platform: gpio
-    name: "Master Bed"
-    id: master_bed_switch
-    internal: true
+    name: "a8-relay5"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 4
@@ -86,288 +79,117 @@ switch:
       inverted: true
 
   - platform: gpio
-    name: "Ensuite"
-    id: ensuite_switch
+    name: "a8-relay6"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 5
       mode: OUTPUT
-      inverted: false
+      inverted: true
 
   - platform: gpio
-    name: "Bathroom"
-    id: bathroom_switch
+    name: "a8-relay7"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 6
       mode: OUTPUT
-      inverted: false
+      inverted: true
 
   - platform: gpio
-    name: "Office"
-    id: office_switch
-    internal: true
+    name: "a8-relay8"
     pin:
       pcf8574: pcf8574_hub_out_1
       number: 7
       mode: OUTPUT
       inverted: true
 
-  # Zone enable switches
-  - platform: template
-    name: "Living Zone Enabled"
-    id: living_enabled
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+# binary_sensor:
+#   - platform: gpio
+#     name: "a8-input1"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 0
+#       mode: INPUT
+#       inverted: true
 
-  - platform: template
-    name: "Office Zone Enabled"
-    id: office_enabled
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+#   - platform: gpio
+#     name: "a8-input2"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 1
+#       mode: INPUT
+#       inverted: true
 
-  - platform: template
-    name: "Nursery Zone Enabled"
-    id: nursery_enabled
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+#   - platform: gpio
+#     name: "a8-input3"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 2
+#       mode: INPUT
+#       inverted: true
 
-  - platform: template
-    name: "Dining Zone Enabled"
-    id: dining_enabled
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+#   - platform: gpio
+#     name: "a8-input4"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 3
+#       mode: INPUT
+#       inverted: true
 
-  - platform: template
-    name: "Master Bed Zone Enabled"
-    id: master_bed_enabled
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+#   - platform: gpio
+#     name: "a8-input5"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 4
+#       mode: INPUT
+#       inverted: true
 
-# ----------------------- TEMPERATURE SENSORS ------------------
-sensor:
-  - platform: homeassistant
-    name: "Living Room Temperature"
-    entity_id: sensor.living_room_ep1_temperature
-    id: living_temp
-  - platform: homeassistant
-    name: "Office Temperature"
-    entity_id: sensor.office_ep1_temperature
-    id: office_temp
-  - platform: homeassistant
-    name: "Nursery Temperature"
-    entity_id: sensor.nursery_ep1_temperature
-    id: nursery_temp
-  - platform: homeassistant
-    name: "Dining Temperature"
-    entity_id: sensor.dining_ep1_temperature
-    id: dining_temp
-  - platform: homeassistant
-    name: "Master Bed Temperature"
-    entity_id: sensor.master_bed_ep1_temperature
-    id: master_bed_temp
+#   - platform: gpio
+#     name: "a8-input6"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 5
+#       mode: INPUT
+#       inverted: true
 
-# -------------------- MIRROR MASTER HVAC MODE -----------------
+#   - platform: gpio
+#     name: "a8-input7"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 6
+#       mode: INPUT
+#       inverted: true
 
-text_sensor:
-  - platform: homeassistant
-    id: main_hvac_mode
-    entity_id: climate.daikinap69199
-    attribute: hvac_mode
-    on_value:
-      then:
-        - lambda: |-
-            using namespace climate;
-            ClimateMode m = CLIMATE_MODE_AUTO;
-            if (id(main_hvac_mode).state == "heat") m = CLIMATE_MODE_HEAT;
-            if (id(main_hvac_mode).state == "cool") m = CLIMATE_MODE_COOL;
-            if (id(main_hvac_mode).state == "off")  m = CLIMATE_MODE_OFF;
-            id(living_thermostat).mode = m;       id(living_thermostat).publish_state();
-            id(office_thermostat).mode = m;       id(office_thermostat).publish_state();
-            id(nursery_thermostat).mode = m;      id(nursery_thermostat).publish_state();
-            id(dining_thermostat).mode = m;       id(dining_thermostat).publish_state();
-            id(master_bed_thermostat).mode = m;   id(master_bed_thermostat).publish_state();
+#   - platform: gpio
+#     name: "a8-input8"
+#     pin:
+#       pcf8574: pcf8574_hub_in_1
+#       number: 7
+#       mode: INPUT
+#       inverted: true
 
-# ------------------------ CLIMATE ZONES -----------------------
+#   - platform: gpio
+#     name: "a8-s3"
+#     pin:
+#       number: 32
+#       inverted: true
 
-climate:
-  - platform: thermostat
-    name: "Living Room Thermostat"
-    id: living_thermostat
-    sensor: living_temp
-    min_idle_time: 30s
-    min_heating_off_time: 60s
-    min_heating_run_time: 90s
-    min_cooling_off_time: 60s
-    min_cooling_run_time: 90s
-    visual: {min_temperature: 16, max_temperature: 28, temperature_step: 1}
-    heat_action: [ switch.turn_off: living_switch ]
-    cool_action: [ switch.turn_off: living_switch ]
-    idle_action: [ switch.turn_on: living_switch ]
-    on_boot_restore_from: memory
+#   - platform: gpio
+#     name: "a8-s4"
+#     pin:
+#       number: 33
+#       inverted: true
 
-  - platform: thermostat
-    name: "Office Thermostat"
-    id: office_thermostat
-    sensor: office_temp
-    min_idle_time: 30s
-    min_heating_off_time: 60s
-    min_heating_run_time: 90s
-    min_cooling_off_time: 60s
-    min_cooling_run_time: 90s
-    visual: {min_temperature: 16, max_temperature: 28, temperature_step: 1}
-    heat_action: [ switch.turn_off: office_switch ]
-    cool_action: [ switch.turn_off: office_switch ]
-    idle_action: [ switch.turn_on: office_switch ]
-    on_boot_restore_from: memory
+# one_wire:
+#   - platform: gpio
+#     pin: GPIO14
 
-  - platform: thermostat
-    name: "Nursery Thermostat"
-    id: nursery_thermostat
-    sensor: nursery_temp
-    min_idle_time: 30s
-    min_heating_off_time: 60s
-    min_heating_run_time: 90s
-    min_cooling_off_time: 60s
-    min_cooling_run_time: 90s
-    visual: {min_temperature: 16, max_temperature: 28, temperature_step: 1}
-    heat_action: [ switch.turn_off: nursery_switch ]
-    cool_action: [ switch.turn_off: nursery_switch ]
-    idle_action: [ switch.turn_on: nursery_switch ]
-    on_boot_restore_from: memory
+# sensor:
+#   - platform: dallas_temp
+#     address: 0x1c0000031edd2a28 #replace with your sensor's ID
+#     name: "ds18b20-1"
 
-  - platform: thermostat
-    name: "Dining Thermostat"
-    id: dining_thermostat
-    sensor: dining_temp
-    min_idle_time: 30s
-    min_heating_off_time: 60s
-    min_heating_run_time: 90s
-    min_cooling_off_time: 60s
-    min_cooling_run_time: 90s
-    visual: {min_temperature: 16, max_temperature: 28, temperature_step: 1}
-    heat_action: [ switch.turn_off: dining_switch ]
-    cool_action: [ switch.turn_off: dining_switch ]
-    idle_action: [ switch.turn_on: dining_switch ]
-    on_boot_restore_from: memory
+# Enable logging
+logger:
 
-  - platform: thermostat
-    name: "Master Bed Thermostat"
-    id: master_bed_thermostat
-    sensor: master_bed_temp
-    min_idle_time: 30s
-    min_heating_off_time: 60s
-    min_heating_run_time: 90s
-    min_cooling_off_time: 60s
-    min_cooling_run_time: 90s
-    visual: {min_temperature: 16, max_temperature: 28, temperature_step: 1}
-    heat_action: [ switch.turn_off: master_bed_switch ]
-    cool_action: [ switch.turn_off: master_bed_switch ]
-    idle_action: [ switch.turn_on: master_bed_switch ]
-    on_boot_restore_from: memory
-
-# -----------------------  BINARY SENSORS ----------------------
-binary_sensor:
-  # ---- All-zones satisfied watchdog ----
-  - platform: template
-    id: all_zones_satisfied
-    name: "All Zones Satisfied"
-    lambda: |-
-      return id(living_switch).state &&
-             id(office_switch).state &&
-             id(nursery_switch).state &&
-             id(dining_switch).state &&
-             id(master_bed_switch).state;
-    on_press:
-      - homeassistant.service: {service: climate.turn_off, data: {entity_id: climate.daikinap69199}}
-    on_release:
-      - homeassistant.service: {service: climate.turn_on,  data: {entity_id: climate.daikinap69199}}
-
-  # ---- Damper-open indicators ----
-  - platform: template
-    name: "Living Damper Open"
-    lambda: 'return !id(living_switch).state;'
-  - platform: template
-    name: "Office Damper Open"
-    lambda: 'return !id(office_switch).state;'
-  - platform: template
-    name: "Nursery Damper Open"
-    lambda: 'return !id(nursery_switch).state;'
-  - platform: template
-    name: "Dining Damper Open"
-    lambda: 'return !id(dining_switch).state;'
-  - platform: template
-    name: "Master Bed Damper Open"
-    lambda: 'return !id(master_bed_switch).state;'
-  - platform: template
-    name: "Ensuite Damper Open"
-    lambda: 'return id(ensuite_switch).state;'
-  - platform: template
-    name: "Bathroom Damper Open"
-    lambda: 'return id(bathroom_switch).state;'
-
-  # ---- Close damper if thermostat OFF **or zone disabled** ----
-  - platform: template
-    id: living_off
-    lambda: |-
-      return id(living_thermostat).mode == climate::CLIMATE_MODE_OFF ||
-             !id(living_enabled).state;
-    on_press:   [ switch.turn_on: living_switch  ]
-    on_release: [ switch.turn_off: living_switch ]
-
-  - platform: template
-    id: office_off
-    lambda: |-
-      return id(office_thermostat).mode == climate::CLIMATE_MODE_OFF ||
-             !id(office_enabled).state;
-    on_press:   [ switch.turn_on: office_switch  ]
-    on_release: [ switch.turn_off: office_switch ]
-
-  - platform: template
-    id: nursery_off
-    lambda: |-
-      return id(nursery_thermostat).mode == climate::CLIMATE_MODE_OFF ||
-             !id(nursery_enabled).state;
-    on_press:   [ switch.turn_on: nursery_switch ]
-    on_release: [ switch.turn_off: nursery_switch ]
-
-  - platform: template
-    id: dining_off
-    lambda: |-
-      return id(dining_thermostat).mode == climate::CLIMATE_MODE_OFF ||
-             !id(dining_enabled).state;
-    on_press:   [ switch.turn_on: dining_switch  ]
-    on_release: [ switch.turn_off: dining_switch ]
-
-  - platform: template
-    id: master_bed_off
-    lambda: |-
-      return id(master_bed_thermostat).mode == climate::CLIMATE_MODE_OFF ||
-             !id(master_bed_enabled).state;
-    on_press:   [ switch.turn_on: master_bed_switch  ]
-    on_release: [ switch.turn_off: master_bed_switch ]
-
-interval:
-  - interval: 15s
-    then:
-      - lambda: |-
-          // publish "all_zones_satisfied"
-          bool sat =
-            id(living_switch).state &&
-            id(office_switch).state &&
-            id(nursery_switch).state &&
-            id(dining_switch).state &&
-            id(master_bed_switch).state;
-          id(all_zones_satisfied).publish_state(sat);
-
-          // count dampers that are OPEN (false == open) AND zone enabled
-          int open_zones = 0;
-          if ( id(office_enabled).state      && !id(office_switch).state)      open_zones++;
-          if ( id(nursery_enabled).state     && !id(nursery_switch).state)     open_zones++;
-          if ( id(dining_enabled).state      && !id(dining_switch).state)      open_zones++;
-          if ( id(master_bed_enabled).state  && !id(master_bed_switch).state)  open_zones++;
-
-          // force Living damper open if 2 or fewer enabled zones open
-          if (open_zones <= 2) {
-            id(living_switch).turn_off();   // open damper (false == open)
-          }
+# Enable Home Assistant API
+api:
