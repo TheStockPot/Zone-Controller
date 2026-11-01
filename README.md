@@ -229,8 +229,9 @@ Full step-by-step field values and a verification checklist are in
   via a manual Sleep toggle or automatically during a scheduled evening window.
 - **Comfort boost** — a per-room toggle that temporarily applies the colder
   sleep setpoint during the day and keeps the room eligible even if it's
-  occupancy-gated (e.g. cool the master down while someone's getting ready in it),
-  until you switch it back off.
+  occupancy-gated (e.g. cool the master down while someone's getting ready in it).
+  It switches itself off after a set time (default 2 h), or sooner by hand, and
+  never takes priority away from the nursery.
 - **Scheduled activation** — a room can pre-cool on a daily window when the
   house is occupied; the window itself applies the colder night setpoint, so the
   master bedroom actively cools toward 68 °F from around 8pm for a cold bed.
@@ -250,15 +251,17 @@ Full step-by-step field values and a verification checklist are in
   toggle turns it from a passive relief valve into a conditioned bedroom (own
   sensor + setpoints, 8pm pre-cool to its sleep target, and its own comfort
   boost), honored after the nursery and master. It still opens as the
-  last-resort relief valve whenever the coordinator flags it, guest mode or not.
+  last-resort relief valve whenever the coordinator flags it, guest mode or not -
+  but only down to a floor (default 3° below its current target), so a long
+  server cooling cycle can't freeze it.
 - **Priority yield** — a room can be told to close its damper while a
   higher-priority room is being served, concentrating all the airflow on that
   room, then reopen. It can be scoped to *urgent* cases only (via that room's
   urgent-demand output) so a room yields just when, say, the nursery is far past
   its target, and both share again once it recovers.
 - **Status output** — the coordinator writes a compact one-line summary of every
-  decision to an optional `input_text` (e.g. `Cooling: Master bedroom · set 68°
-  (hall 70°) · Home Night`), updated only when the decision changes, so you can
+  decision to an optional `input_text` in plain English (e.g. `Cooling the master
+  bedroom · thermostat at 68° (hallway 70°) to keep it running · night`), updated only when the decision changes, so you can
   see at a glance what it did and why.
 - **Pressure relief** — the duct is never over-pressurized: while cooling the
   system keeps a minimum number of zones open (default 2) so the unit never runs
