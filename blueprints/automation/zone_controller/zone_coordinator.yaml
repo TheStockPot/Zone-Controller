@@ -121,7 +121,7 @@ blueprint:
             the "Theater relief output" above instead). If set, the coordinator
             drives this damper directly as the relief valve, which would fight the
             theater's Room Zone.
-          default: {}
+          default: []
           selector:
             entity:
               multiple: true
@@ -174,7 +174,7 @@ blueprint:
             Leave unset to fall back to counting rooms CALLING (which doesn't
             account for a yielded damper). Recommended: set it to the server
             damper.
-          default: {}
+          default: []
           selector:
             entity:
               multiple: true

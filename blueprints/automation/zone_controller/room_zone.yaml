@@ -477,7 +477,7 @@ blueprint:
             the one above. This room closes its damper while ANY of them is being
             served. Use it on the theater (lowest priority) with the nursery and
             master demand helpers, so the guest room is honored last.
-          default: {}
+          default: []
           selector:
             entity:
               multiple: true
