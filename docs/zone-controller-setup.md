@@ -150,7 +150,12 @@ resumes. (Omitted from the per-room lists below for brevity — set it on each.)
   (e.g. someone's getting ready in there). While on, the room uses the colder
   target **and** stays eligible even though it's occupancy-gated, so it cools
   regardless of the clock or whether the occupancy sensor sees anyone. Turn it off
-  to return to the normal day target. Its status shows `(boost)`.
+  to return to the normal day target. Its status shows `(boost, 85 min left)`.
+  - **Comfort boost auto-off:** **120** (minutes) — the boost switches itself off
+    after this long, so a daytime "cool it down" can't run all afternoon. Set
+    `0` to keep it on until turned off by hand.
+  - A boost does **not** stop the master from yielding to an urgent nursery —
+    the nursery still comes first.
 - **Away Setpoint Override:** Home-occupied toggle → `input_boolean.<your_home_occupied>`
   · Away cool setpoint → `input_number.master_away_cool_sp` (**75**). While away
   (home toggle off) the master stays eligible **even though it's occupancy-gated**
@@ -242,6 +247,14 @@ the coordinator says relief is needed.
   `input_boolean.zc_theater_relief` — **required.** This is how the theater stays
   the relief valve: the coordinator turns this flag on whenever the duct needs a
   relief path, and the theater opens regardless of guest mode or yielding.
+- **Away Circulation Purge → Force-open floor below cool setpoint:** **3** — the
+  relief valve stops taking air once the theater is 3° below its effective cool
+  target (e.g. **66 °F** at night on the 69 °F sleep setpoint, 71 °F by day), and
+  re-opens for relief once it warms back above that (+ hysteresis). Without it, a
+  long server cooling cycle with every bedroom satisfied keeps the theater open
+  as the only second zone all night and freezes it (a guest woke to < 62 °F).
+  While the theater is held closed the server runs with only the hallway as
+  extra relief.
 
 > **Trade-off to know:** because the guest room yields to the master, on a night
 > when the master is pre-cooling to its sleep target for a long time the theater
@@ -297,7 +310,7 @@ Create **one** automation from the **Coordinator** blueprint:
 - Last-changeover helper: `input_datetime.zc_last_changeover`
 - Status / decision output *(optional but recommended)*: `input_text.zc_status`
   — the coordinator writes a one-line summary of every decision here, e.g.
-  `Cooling: Master bedroom · set 68° (hall 70°) · Home Night`. Add it to a dashboard
+  `Cooling the master bedroom · thermostat at 68° (hallway 70°) to keep it running · night`. Add it to a dashboard
   (or just watch it in Developer Tools → States) to see exactly what the
   coordinator did and why on each run. See **Reading the status line** below.
 - Full manual override / bypass *(optional)*: `input_boolean.zc_bypass` — while on,
@@ -323,9 +336,9 @@ Create **one** automation from the **Coordinator** blueprint:
 > to 78 the way a hallway-only band allowed. Use **Vacation** to turn the unit
 > fully off instead.
 - Night starts / ends at: **21:00:00** / **07:00:00** *(label-only — drives the
-  `Home Night` vs `Home Day` status; the window may cross midnight)*
+  `night` status note; the window may cross midnight)*
 - Night/sleep toggle *(optional)*: `input_boolean.<your_sleep_mode>` — while on,
-  the status shows `Home Night` regardless of the clock. Changes no conditioning.
+  the status shows `night` regardless of the clock. Changes no conditioning.
 - **Idle Behavior** (what to do when no room is calling):
   - Idle behavior: **Hold a heat_cool safety band** — keeps the unit in
     `heat_cool` on the band below, so the whole house stays between the limits
@@ -360,8 +373,8 @@ Create **one** automation from the **Coordinator** blueprint:
     open**, moving air through all the ducts to discourage stagnant-air mold and
     condensation. It never heats or cools, and it **yields the unit instantly**
     the moment a room calls or you come home (the window ends and normal control
-    resumes). The status line reads `Circulation purge - fan on, all dampers open
-    (mold prevention) - <mode>`.
+    resumes). The status line reads `Airing out the ducts - fan only, every vent
+    open while nobody's home`.
 - **Setpoint Force-Run** (optional but recommended — see below):
   - Manage the unit's setpoint: **on**
   - Force-run offset: **2** · Setpoint floor: **60** · Setpoint ceiling: **85**
@@ -417,7 +430,7 @@ satisfied. The target is clamped between the floor and ceiling.
   all dampers until you turn it off, at which point automation resumes (within
   the ~2 min re-sync). **Point every Room Zone's *Full manual override* input and
   the Coordinator's at this same `zc_bypass` toggle.** The status lines read
-  `Manual override ON ...` while it's active.
+  `Manual override - …` while it's active.
 - **Soft (only if you enabled the off-by-default grace)** — change the setpoint by
   hand and the coordinator leaves it alone for the grace period. Off by default;
   prefer the toggles above.
@@ -454,7 +467,7 @@ satisfied. The target is clamped between the floor and ceiling.
      `Idle …`, not riding along), and all the air goes to the two bedrooms.
    - Now satisfy the master (or the nursery) so only **one** room is calling.
      Within a re-sync `zc_cool_relief` flips **on**, the **server damper opens**
-     (status `Riding along (pressure relief) …`) as the second zone, and
+     (status `Open as a spare vent while the unit cools …`) as the second zone, and
      `switch.damper_theater` stays **on** (closed).
    - Force the server cold (below its ride-along floor) so it drops out, leaving
      one zone — now the theater goes **off** (open) as the backstop.
@@ -474,16 +487,22 @@ satisfied. The target is clamped between the floor and ceiling.
      regardless of any of the above.
    - **Theater relief (guest mode off).** With guest mode off, close every room
      damper (nothing calling): `input_boolean.zc_theater_relief` turns **on** and
-     the theater's status reads `Relief valve open (pressure relief)` with
+     the theater's status reads `Open to ease duct pressure …` with
      `switch.damper_theater` **off** (open). Make a room call so 2 zones open → the
-     flag turns **off** and the theater closes (status `Off (disabled)`).
+     flag turns **off** and the theater closes (status `Turned off`).
+   - **Theater relief floor.** With the relief flag on, let the theater drop more
+     than 3° below its effective cool target (or temporarily raise
+     `theater_sleep_cool_sp`/`theater_cool_sp`): `switch.damper_theater` goes
+     **on** (closed) even though `zc_theater_relief` is still on, and the status
+     reads `Too cold to take extra air …`. It re-opens once the room is back
+     above the floor + hysteresis.
    - **Guest room mode.** Turn on `input_boolean.theater_guest_mode` and set the
      theater above its cool setpoint: `input_text.theater_demand` goes `cool`, the
      unit runs cool, and `switch.damper_theater` goes **off** (open) to serve it.
-     Now make the master call: the theater's status reads `Cooling (yielding to
-     priority) …` and its damper closes until the master is satisfied.
+     Now make the master call: the theater's status reads `Wants cooling, but the
+     master bedroom gets the air first …` and its damper closes until the master is satisfied.
    - **Guest pre-cool + boost.** With guest mode on, after 20:00 (house occupied)
-     the theater's target drops to its sleep setpoint (status `… (sleep)`). During
+     the theater's target drops to its sleep setpoint (status `… (night target)`). During
      the day, `input_boolean.theater_boost` does the same on demand (`… (boost)`).
 6. **Main on/off.** With a room calling, the unit switches on in the winning
    direction. With every room satisfied/disabled, it switches off.
@@ -494,14 +513,14 @@ satisfied. The target is clamped between the floor and ceiling.
    - **Comfort boost.** In the middle of the day, turn on
      `input_boolean.master_boost`: the master switches to the 68 °F target and
      becomes eligible even if the occupancy sensor reads clear, so a 73° room
-     starts cooling; its status shows `Cooling … (boost)`. Turn it off → back to
+     starts cooling; its status shows `Cooling · 73.0° → 68.0° (boost, 120 min left)`. Turn it off (or wait for the auto-off) → back to
      the 75 °F day target.
 8. **Away.** Turn off `input_boolean.<your_home_occupied>` with nobody in
    `zone.home_wide` (or set the house-mode selector to Away). The eco preset is
    applied and each room switches to its **away** cool setpoint. With the master's
-   away setpoint at 75, warm it past 75 → its status shows `Cooling … (away)`, it's
+   away setpoint at 75, warm it past 75 → its status shows `Cooling … (away target)`, it's
    served (even though unoccupied), and it's held at ~75 instead of drifting to 78.
-   Rooms without an away setpoint just use their normal setpoints. Mode = `Eco Away`.
+   Rooms without an away setpoint just use their normal setpoints. The coordinator status ends with `eco - nobody's home`.
 9. **Idle band.** With every room satisfied (nobody calling) and idle behavior
    set to **hold band**, the unit should sit in `heat_cool` on the 64–76 band
    (`Idle - holding 64-76° band` in the status line) — cooling if the house
@@ -530,7 +549,7 @@ satisfied. The target is clamped between the floor and ceiling.
     coordinator stops changing the setpoint (you set it) but still zones. Off →
     it resumes force-run.
 11. **Full bypass.** Turn `input_boolean.zc_bypass` on: within the re-sync the
-    status lines read `Manual override ON ...`, and now change the thermostat,
+    status lines read `Manual override - …`, and now change the thermostat,
     mode, and any damper by hand — nothing gets reverted. Turn it off → automation
     resumes and takes the dampers/unit back over.
 
@@ -549,88 +568,90 @@ all_others_closed: {{ zone_dampers | reject('is_state','off') | list | count == 
 ### Reading the status line
 
 If you wired up the optional `input_text.zc_status` helper, the coordinator
-writes a compact, scannable one-liner of what it decided. It **updates only when
-the decision changes** (not every cycle), so use the entity's *last changed* time
-to see when the coordinator last acted. Format — three parts joined by ` · `:
+writes one short, plain-English line saying what the unit is doing and why. It
+**updates only when the decision changes** (not every cycle), so use the entity's
+*last changed* time to see when the coordinator last acted. It's a headline,
+followed by any short notes that apply, joined by ` · `:
 
 ```
-<action + room(s)> · <setpoint> · <house mode>
+<what it's doing, for whom> · <who's waiting> · <relief> · <thermostat> · <house mode>
 ```
 
-The **setpoint** part only appears when Setpoint Force-Run is actively managing
-the target.
+**Headline:**
+- `Cooling the nursery and master bedroom` / `Heating the nursery` — running in
+  that direction for those rooms.
+- `Cooling - the hallway is over 76°` — no room asked; the hallway passed the cap.
+- `Nursery needs heat - switching over in 2 min to protect the compressor` — a
+  higher-priority room wants the other direction; the reversal cooldown is
+  running.
+- `Every room is comfortable - just keeping the house between 64° and 76°` —
+  nothing is calling and idle behavior is "hold band".
+- `Off - every room is comfortable` — nothing is calling and idle behavior is "off".
+- `Off - vacation mode` / `Off - nobody's home` — the unit is forced off.
 
-**Action + room(s)** — the action, with the room(s) it's serving merged in (no
-separate "cooling:" list):
-- `Cooling: Master bedroom` / `Heating: Nursery` — running in that direction for
-  the named room(s); multiple rooms are comma-separated.
-- `Cooling · hallway over 76°` — cooling only because the hallway passed the cap
-  (no room asked), so there's no room name.
-- `Waiting to cool · cooldown 1/3m: Nursery` — a reversal is wanted for the
-  nursery but the compressor cooldown is blocking it (1 of 3 min elapsed).
-- `Idle · 64-76° band` — nothing is calling and idle behavior is "hold band".
-- `Off · no demand` — nothing is calling and idle behavior is "off".
-- `Off` — the unit is forced off (see the mode: `Vacation`, or `Away` with the
-  turn-off action).
-
-**Setpoint** (force-run):
-- `set 68° (hall 70°)` — the coordinator pushed the thermostat target to **68**
-  while the hallway (which the thermostat senses) reads **70**. This is a *control
-  lever* to keep the unit running — **not** the temperature any room is aimed at.
-  Each room is served by its own damper; "68° while the hallway reads 70°" just
-  means "keep cooling", it does **not** mean the house is being cooled to 68.
-- `manual setpoint` — the hard manual override toggle is on; the coordinator isn't
-  touching the target.
-- `manual change - holding` — only if you enabled the (off-by-default) auto
-  manual-edit grace.
-
-**House mode:** `Home Day` · `Home Night` (inside the night window, or the
-night/sleep toggle is on) · `Eco Away` (nobody home, eco action) · `Away` (nobody
-home, "do nothing"/"turn off" action) · `Vacation` (house-mode selector). The
-Day/Night split comes from the **Night starts/ends at** times (default 21:00 →
-07:00) plus the optional **Night/sleep toggle** — both label-only.
+**Notes** (each appears only when it applies):
+- `master bedroom waits its turn for heat` — a lower-priority room wants the
+  other direction and is waiting until the current room is satisfied.
+- `too few vents open, so the theater is asked to open` — too few vents were open while
+  cooling, so the theater was flagged as the relief valve (it opens unless it's
+  already at its cold floor — check the theater's own status).
+- `thermostat at 68° (hallway 70°) to keep it running` — Setpoint Force-Run. The
+  thermostat senses the hallway, so the coordinator pushes its target past the
+  hallway temperature to keep the unit running. It's a *control lever*, **not**
+  the temperature any room is aimed at.
+- `thermostat on manual` — the hard manual setpoint toggle is on.
+- `leaving your thermostat change alone for now` — only if you enabled the
+  (off-by-default) auto manual-edit grace.
+- `night` / `nobody's home` / `eco - nobody's home` / `vacation` — the house
+  mode, shown only when it isn't a normal day at home. "Night" comes from the
+  **Night starts/ends at** times (default 21:00 → 07:00) or the optional
+  **Night/sleep toggle** — label only.
 
 Examples:
 
 ```
-Cooling: Master bedroom · set 68° (hall 70°) · Home Night
-Cooling: Nursery, Master bedroom · set 68° (hall 71°) · Eco Away
-Waiting to cool · cooldown 1/3m: Nursery · Home Day
-Idle · 64-76° band · Home Night
-Off · no demand · Home Day
-Off · Vacation
-Circulation purge - fan on, all dampers open (mold prevention) - Away
+Cooling the master bedroom · thermostat at 68° (hallway 70°) to keep it running · night
+Cooling the server room · too few vents open, so the theater is asked to open · thermostat at 68° (hallway 70°) to keep it running · night
+Heating the nursery · master bedroom waits its turn for cool · thermostat at 72° (hallway 70°) to keep it running
+Nursery needs cooling - switching over in 2 min to protect the compressor
+Every room is comfortable - just keeping the house between 64° and 76° · night
+Off - vacation mode
+Airing out the ducts - fan only, every vent open while nobody's home
+Manual override - hands off the HVAC until it is turned off
 ```
 
 If the status line **never updates**, the coordinator automation itself isn't
-running — check that it's enabled and look at its trace. If it shows
-`Off · no demand` while a room is hot, that room isn't publishing demand
-(check its demand `input_text` and temp sensor).
+running — check that it's enabled and look at its trace. If it says
+`Off - every room is comfortable` while a room is hot, that room isn't publishing
+demand (check its demand `input_text` and temp sensor).
 
 ### Reading a room's status
 
-Each Room Zone can also write a plain-English line to its own status helper
-explaining **why it is or isn't calling** — its temperature vs its *effective*
-target, whether it's on day or sleep setpoints, and whether it's yielding or
-disabled. Examples:
+Each Room Zone can also write a short line to its own status helper explaining
+**what the room is doing and why** — its temperature, the target it's using, and
+whether it's waiting, yielding, relieving or turned off. Examples:
 
 ```
-Cooling - 76.4° vs 75.0° target (day)                 ← above the 75° day target, so it's calling
-Cooling - 68.5° vs 68.0° target (sleep)               ← on the sleep setpoint (why it cools a ~68° room)
-Cooling - 76.0° vs 75.0° target (away)                ← nobody home: held at the away setpoint (not baking)
-Idle - 71.0° (cool above 72.0°, heat below 68.0°) (day)  ← comfortable, not calling
-Heating - 66.5° vs 68.0° target
-Cooling (yielding to priority) - 76.0° vs 75.0° target (day)  ← damper closed to focus air on the nursery
-Riding along (pressure relief) - 72.0°, taking cool air down to 70.0°  ← server: 2nd zone while cooling
-Idle - 73.0° (not eligible: occupancy/schedule)       ← gated off by occupancy or its window
-Off (disabled)                                        ← enable toggle is off
-No temperature reading                                ← sensor unavailable (fails safe to idle)
+Cooling · 76.4° → 75.0° (day target)                       ← above its day target, so it's calling
+Cooling · 68.5° → 68.0° (night target)                     ← on the sleep / pre-cool setpoint
+Cooling · 72.4° → 68.0° (boost, 85 min left)               ← comfort boost on, auto-off countdown
+Cooling · 76.0° → 75.0° (away target)                      ← nobody home: held at the away setpoint
+Heating · 66.5° → 68.0° (day target)
+Comfortable · 71.0° (cools above 72.0°, heats below 68.0°, day target)  ← not calling
+Wants cooling, but the nursery gets the air first · 76.0° → 75.0°        ← yielding to a priority room
+Wants heating - waiting for the unit to switch over · 66.0° → 68.0°      ← unit is busy the other way
+Open as a spare vent while the unit cools · 72.0°, closes at 70.0°       ← server riding along
+Open to ease duct pressure · 67.2°, closes at 66.0°        ← theater acting as the relief valve
+Too cold to take extra air · 65.8°, reopens at 66.5°       ← theater relief held closed at its floor
+Unoccupied, so not conditioning · 73.0°                    ← gated off by occupancy or its schedule
+Turned off                                                 ← enable toggle is off
+No temperature reading - keeping the damper closed         ← sensor unavailable (fails safe)
 ```
 
 This is the companion to the coordinator line: the coordinator explains what the
 *unit* is doing; each room status explains what that *room* wants and why. The
-`(day)` / `(sleep)` / `(away)` tag is the quickest way to catch a stuck sleep
-toggle or confirm the away cap is in effect.
+target tag (`day target` / `night target` / `boost` / `away target`) is the
+quickest way to catch a stuck sleep toggle or confirm the away cap is in effect.
 
 ## Notes & limitations
 

@@ -209,7 +209,8 @@ blueprint:
           name: Status / decision output (input_text, optional)
           description: >
             Optional input_text the coordinator writes a one-line summary of each
-            decision to (e.g. "Cooling: Master bedroom · set 68° (hall 70°) · Home Night").
+            decision to, in plain English (e.g. "Cooling the master bedroom ·
+            thermostat at 68° (hallway 70°) to keep it running · night").
             It only rewrites when the decision changes, so watch its last-changed
             time to see when the coordinator last acted.
             Purely diagnostic - watch it to see what the coordinator did and why.
@@ -309,14 +310,14 @@ blueprint:
         night_start:
           name: Night starts at (time of day)
           description: >
-            Used only to label the status line "Home Night" vs "Home Day". The
+            Used only to add "night" to the status line. The
             night window may cross midnight (e.g. 21:00 -> 07:00). Purely cosmetic.
           default: "21:00:00"
           selector:
             time:
         night_end:
           name: Night ends at (time of day)
-          description: End of the night window (for the "Home Night" status label).
+          description: End of the night window (for the "night" status label).
           default: "07:00:00"
           selector:
             time:
@@ -324,7 +325,7 @@ blueprint:
           name: Night/sleep toggle (optional)
           description: >
             Optional input_boolean (e.g. your sleep toggle). While on, the status
-            shows "Home Night" regardless of the time window above. Status label
+            shows "night" regardless of the time window above. Status label
             only - it does not change any conditioning behavior.
           default: {}
           selector:
@@ -823,45 +824,70 @@ variables:
     {{ manage_setpoint and unit_should_run and not manual_hard
        and sensed_valid }}
   # --- status / decision summary (for the optional status_helper) ---
-  # A compact, scannable one-liner:  <action + room(s)> · <setpoint> · <mode>
-  # e.g.  "Cooling: Master bedroom · set 68° (hall 70°) · Home Night".
-  status_verb: "{{ 'Cooling' if winner_dir == 'cool' else 'Heating' }}"
-  status_verb_lc: "{{ 'cool' if winner_dir == 'cool' else 'heat' }}"
-  # Rooms currently calling, by direction (friendly names, " demand" stripped).
-  status_cooling_rooms: "{{ (zone_demands | select('is_state', 'cool') | map('state_attr', 'friendly_name') | select('string') | list | join(', ')) | replace(' demand', '') | replace(' Demand', '') }}"
-  status_heating_rooms: "{{ (zone_demands | select('is_state', 'heat') | map('state_attr', 'friendly_name') | select('string') | list | join(', ')) | replace(' demand', '') | replace(' Demand', '') }}"
-  # The room(s) in the winning direction (empty when the cap, not a room, calls).
+  # A short, plain-English line saying what the unit is doing and why, e.g.
+  #   "Cooling the nursery and master bedroom · thermostat at 68° (hallway 70°) to keep it running · night"
+  # Rooms calling in a direction, as a friendly list ("nursery and master bedroom").
+  status_cool_names: >
+    {{ zone_demands | select('is_state', 'cool') | map('state_attr', 'friendly_name')
+       | select('string') | map('lower') | map('replace', ' demand', '') | list }}
+  status_heat_names: >
+    {{ zone_demands | select('is_state', 'heat') | map('state_attr', 'friendly_name')
+       | select('string') | map('lower') | map('replace', ' demand', '') | list }}
+  status_win_names: >
+    {{ status_cool_names if winner_dir == 'cool'
+       else status_heat_names if winner_dir == 'heat' else [] }}
+  # Rooms that want the OTHER direction and are waiting their turn.
+  status_wait_names: >
+    {{ status_heat_names if winner_dir == 'cool'
+       else status_cool_names if winner_dir == 'heat' else [] }}
   status_win_rooms: >-
-    {{ status_cooling_rooms if winner_dir == 'cool'
-       else status_heating_rooms if winner_dir == 'heat' else '' }}
-  # Headline: the action, merged with the room(s) it is for (no redundant repeat).
+    {%- set n = status_win_names -%}
+    {{ (n[:-1] | join(', ') ~ ' and ' ~ n[-1]) if n | count > 1 else n | join('') }}
+  status_wait_rooms: >-
+    {%- set n = status_wait_names -%}
+    {{ (n[:-1] | join(', ') ~ ' and ' ~ n[-1]) if n | count > 1 else n | join('') }}
+  status_verb: "{{ 'Cooling' if winner_dir == 'cool' else 'Heating' }}"
+  status_opp: "{{ 'heat' if winner_dir == 'cool' else 'cool' }}"
+  cooldown_left: >
+    {{ [((min_changeover | float(0)) - (mins_since_change | float(0))) | round(0, 'ceil') | int, 1] | max }}
+  # Headline: what the unit is doing and for whom (or why it isn't).
   status_headline: >-
-    {%- if force_off -%}Off
-    {%- elif winner_dir == 'none' and idle_hold -%}Idle · {{ idle_low | round(0) | int }}-{{ idle_high | round(0) | int }}° band
-    {%- elif winner_dir == 'none' -%}Off · no demand
-    {%- elif need_flip and not allow_flip -%}Waiting to {{ status_verb_lc }} · cooldown {{ mins_since_change | round(0) | int }}/{{ min_changeover }}m{% if status_win_rooms %}: {{ status_win_rooms }}{% endif %}
-    {%- else -%}{{ status_verb }}{% if status_win_rooms %}: {{ status_win_rooms }}{% elif cap_active %} · hallway over {{ idle_high | round(0) | int }}°{% endif %}
+    {%- if force_off -%}Off - {{ 'vacation mode' if hm_vacation else "nobody's home" }}
+    {%- elif winner_dir == 'none' and idle_hold -%}Every room is comfortable - just keeping the house between {{ idle_low | round(0) | int }}° and {{ idle_high | round(0) | int }}°
+    {%- elif winner_dir == 'none' -%}Off - every room is comfortable
+    {%- elif need_flip and not allow_flip -%}{{ status_win_rooms | capitalize if status_win_rooms else 'A room' }} needs {{ 'cooling' if winner_dir == 'cool' else 'heat' }} - switching over in {{ cooldown_left }} min to protect the compressor
+    {%- elif status_win_rooms -%}{{ status_verb }} the {{ status_win_rooms }}
+    {%- elif cap_active -%}Cooling - the hallway is over {{ idle_high | round(0) | int }}°
+    {%- else -%}{{ status_verb }}
     {%- endif -%}
-  # House mode (incl. Home Day vs Home Night).
+  # Short "why" notes appended after the headline (each may be empty).
+  status_wait_note: >-
+    {%- if status_wait_rooms and not (need_flip and not allow_flip) -%}{{ status_wait_rooms }} {{ 'wait' if status_wait_names | count > 1 else 'waits' }} its turn for {{ status_opp }}{%- endif -%}
+  status_relief_note: >-
+    {%- if theater_open and winner_dir == 'cool' and not force_off -%}too few vents open, so the theater is asked to open{%- endif -%}
+  # Force-run note: the thermostat target is a lever to keep the unit running
+  # (it senses the hallway), not the room's target.
+  status_sp: >-
+    {%- if manage_setpoint and manual_hard -%}thermostat on manual
+    {%- elif manage_now and grace_active -%}leaving your thermostat change alone for now
+    {%- elif manage_now -%}thermostat at {{ desired_sp | round(0) | int }}° (hallway {{ sensed | round(0) | int }}°) to keep it running
+    {%- endif -%}
+  # Only mention the house mode when it matters.
   status_mode: >-
-    {% if hm_vacation %}Vacation{% elif want_eco %}Eco Away{% elif not home
-    %}Away{% elif is_night %}Home Night{% else %}Home Day{% endif %}
+    {%- if hm_vacation -%}vacation
+    {%- elif want_eco -%}eco - nobody's home
+    {%- elif not home -%}nobody's home
+    {%- elif is_night -%}night
+    {%- endif -%}
   # Status line shown while an away circulation purge is running.
   purge_status_msg: >-
-    Circulation purge - fan on, all dampers open (mold prevention) - {{ status_mode }}
-  # Terse force-run note (empty unless force-run is actively managing the setpoint).
-  # "set 68° (hall 70°)" means the target was pushed to 68 while the hallway reads
-  # 70 - a lever to keep the unit running, not the room's target.
-  status_sp: >-
-    {%- if manage_setpoint and manual_hard -%}manual setpoint
-    {%- elif manage_now and grace_active -%}manual change - holding
-    {%- elif manage_now -%}set {{ desired_sp | round(0) | int }}° (hall {{ sensed | round(0) | int }}°)
-    {%- endif -%}
-  # Final line: headline · [setpoint] · mode. The write below is skipped when the
-  # message is unchanged, so it updates only when the decision actually changes
-  # (HA tracks last_changed for free - no timestamp needed in the value).
+    Airing out the ducts - fan only, every vent open while nobody's home
+  # Final line: headline · notes. The write below is skipped when the message is
+  # unchanged, so it updates only when the decision actually changes (HA tracks
+  # last_changed for free - no timestamp needed in the value).
   status_msg: >-
-    {{ status_headline | trim }}{% if status_sp | trim %} · {{ status_sp | trim }}{% endif %} · {{ status_mode }}
+    {{ ([status_headline | trim] + ([status_wait_note, status_relief_note, status_sp]
+        + ([] if force_off else [status_mode])) | map('trim') | select | list) | join(' · ') }}
 
 trigger:
   - platform: state
@@ -894,13 +920,13 @@ action:
           - condition: template
             value_template: >
               {{ bypassed and status_helper is string
-                 and states(status_helper) != 'Manual override ON - coordinator not controlling the unit' }}
+                 and states(status_helper) != 'Manual override - hands off the HVAC until it is turned off' }}
         sequence:
           - service: input_text.set_value
             target:
               entity_id: !input status_helper
             data:
-              value: "Manual override ON - coordinator not controlling the unit"
+              value: "Manual override - hands off the HVAC until it is turned off"
   - condition: template
     value_template: "{{ not bypassed }}"
 

@@ -235,12 +235,28 @@ blueprint:
             colder target above) AND stays eligible even if it's occupancy-gated,
             so it cools to that target regardless of the time of day. Turn it off
             to return to the normal day behavior. Independent of the whole-house
-            night label - this only affects this room.
+            night label - this only affects this room. A boost never suspends
+            this room's priority yield (it still yields to e.g. an urgent nursery).
           default: {}
           selector:
             entity:
               filter:
                 - domain: input_boolean
+        boost_minutes:
+          name: Comfort boost auto-off (minutes)
+          description: >
+            Turn the comfort boost back off automatically after this long, so a
+            daytime "cool it down" doesn't run all day if nobody remembers to turn
+            it off. 0 = stay on until switched off by hand. Default 120. (A Home
+            Assistant restart restarts the countdown.)
+          default: 120
+          selector:
+            number:
+              min: 0
+              max: 480
+              step: 15
+              unit_of_measurement: min
+              mode: box
 
     away_section:
       name: Away Setpoint Override (optional)
@@ -349,6 +365,25 @@ blueprint:
             entity:
               filter:
                 - domain: input_boolean
+        force_open_floor_margin:
+          name: Force-open floor below cool setpoint (deg)
+          description: >
+            How far below its effective cool setpoint (day / sleep / boost) this
+            room may be cooled while it is only open because of the force-open
+            flag. Once it drops below that floor the damper closes even though the
+            flag is on, and it re-opens for relief once the room warms back above
+            the floor (+ hysteresis) - so a relief valve can't be frozen when some
+            other room (e.g. the server) keeps the unit cooling for hours. Example:
+            sleep setpoint 69, margin 3 -> relief stops at 66. Set to 20 to
+            effectively disable. Default 3.
+          default: 3.0
+          selector:
+            number:
+              min: 0.0
+              max: 20.0
+              step: 0.5
+              unit_of_measurement: deg
+              mode: box
 
     schedule_section:
       name: Scheduled Activation (optional)
@@ -511,6 +546,7 @@ variables:
   sleep_boolean: !input sleep_boolean
   sleep_cool_setpoint: !input sleep_cool_setpoint
   boost_boolean: !input boost_boolean
+  boost_minutes: !input boost_minutes
   home_occupied_ref: !input home_occupied_ref
   away_cool_setpoint: !input away_cool_setpoint
   cool_ride_along: !input cool_ride_along
@@ -518,6 +554,8 @@ variables:
   ride_along_gate: !input ride_along_gate
   purge_until: !input purge_until
   force_open_boolean: !input force_open_boolean
+  force_open_floor_margin: !input force_open_floor_margin
+  damper_switches: !input damper_switches
   active_after: !input active_after
   active_until: !input active_until
   schedule_requires_home: !input schedule_requires_home
@@ -562,11 +600,26 @@ variables:
   # and a daytime boost drops the room to that same colder target on demand.
   # Optional entity inputs are a plain string when set and an empty dict when
   # unset, so `is string` reliably detects "configured".
-  boost_active: "{{ boost_boolean is string and is_state(boost_boolean, 'on') }}"
-  use_night_sp: >
+  boost_on: "{{ boost_boolean is string and is_state(boost_boolean, 'on') }}"
+  # Boost auto-off: minutes the toggle has been on, measured from its
+  # last_changed. Once past boost_minutes (0 = never) the boost is treated as off
+  # for this run and the action below switches the toggle off.
+  boost_on_mins: >
+    {{ ((as_timestamp(now()) - as_timestamp(states[boost_boolean].last_changed)) / 60)
+       if boost_on else 0 }}
+  boost_expired: >
+    {{ boost_on and boost_minutes | float(0) > 0
+       and boost_on_mins | float(0) >= boost_minutes | float(0) }}
+  boost_active: "{{ boost_on and not boost_expired }}"
+  boost_left: >
+    {{ [((boost_minutes | float(0)) - (boost_on_mins | float(0))) | round(0) | int, 0] | max }}
+  # On the night setpoint because of sleep / the schedule (NOT boost). Kept apart
+  # so a daytime boost never suspends the day-only priority yield below.
+  on_night_sp: >
     {{ sleep_cool_setpoint is string and (
          (sleep_boolean is string and is_state(sleep_boolean, 'on'))
-         or schedule_active or boost_active ) }}
+         or schedule_active ) }}
+  use_night_sp: "{{ on_night_sp or (sleep_cool_setpoint is string and boost_active) }}"
   # Away: while the home toggle is OFF and an away setpoint is configured, use it
   # (takes precedence over day/sleep) and keep the room eligible even if
   # occupancy-gated, so it can't bake while nobody is home.
@@ -645,16 +698,21 @@ variables:
           else ([priority_demand_extra] if priority_demand_extra is string else [])) }}
   # Day-only yield: suspend the yield while this room is on its night/sleep
   # setpoint, so at night it keeps its damper open (serving itself + relief)
-  # instead of yielding to the priority room.
-  yield_suspended: "{{ yield_day_only and use_night_sp }}"
+  # instead of yielding to the priority room. A daytime boost does NOT suspend it.
+  yield_suspended: "{{ yield_day_only and on_night_sp }}"
   # Yield while ANY listed higher-priority room is calling in the direction the
   # unit is delivering.
-  priority_served: >
-    {{ not yield_suspended and (
-         (main_mode in ['cool', 'heat_cool']
-          and priority_list | select('is_state', 'cool') | list | count > 0)
-         or (main_mode in ['heat', 'heat_cool']
-          and priority_list | select('is_state', 'heat') | list | count > 0)) }}
+  priority_served_list: >
+    {{ (priority_list | select('is_state', 'cool') | list
+          if main_mode in ['cool', 'heat_cool'] else [])
+       + (priority_list | select('is_state', 'heat') | list
+          if main_mode in ['heat', 'heat_cool'] else []) }}
+  priority_served: "{{ not yield_suspended and priority_served_list | count > 0 }}"
+  # Who we're yielding to, for the status line ("Nursery urgent demand" -> "nursery").
+  yield_to_name: >
+    {{ (priority_served_list | map('state_attr', 'friendly_name') | select('string')
+        | first | default('a higher-priority room'))
+       | lower | replace(' urgent demand', '') | replace(' demand', '') }}
   # Open only when the room's demand matches the direction the unit delivers AND
   # no higher-priority room is currently being served (see priority yield above).
   # Cooling ride-along: while the unit is already cooling, keep this room open for
@@ -677,27 +735,52 @@ variables:
        and as_timestamp(now()) < as_timestamp(states(purge_until), 0) }}
   # Force-open flag (e.g. the coordinator's theater relief output): hold the
   # damper open regardless of demand or enable, as the pressure-relief valve.
-  forced_open: "{{ force_open_boolean is string and is_state(force_open_boolean, 'on') }}"
+  force_open_flag: "{{ force_open_boolean is string and is_state(force_open_boolean, 'on') }}"
+  # Relief floor: the flag can keep the room open for hours while ANOTHER room
+  # (e.g. the server) keeps the unit cooling, so stop taking relief air once the
+  # room is force_open_floor_margin below its effective cool setpoint. The damper's
+  # own state is the memory: once closed, it re-opens only above floor +
+  # hysteresis (no chatter). A missing sensor/setpoint never blocks relief.
+  damper_ids: >
+    {% set e = damper_switches.entity_id
+         if (damper_switches is mapping and 'entity_id' in damper_switches) else [] %}
+    {{ [e] if e is string else e | list }}
+  damper_open_now: "{{ damper_ids | select('is_state', 'off') | list | count > 0 }}"
+  relief_floor: "{{ cool_sp - force_open_floor_margin }}"
+  relief_too_cold: >
+    {{ temp_valid and cool_sp_valid and (
+         temp < relief_floor
+         or (not damper_open_now and temp < relief_floor + hysteresis) ) }}
+  forced_open: "{{ force_open_flag and not relief_too_cold }}"
   should_open: >
     {{ purging or forced_open or (active and not priority_served and (
          (raw_demand == 'cool' and main_mode in ['cool', 'heat_cool']) or
          (raw_demand == 'heat' and main_mode in ['heat', 'heat_cool']) or
          cool_riding
        )) }}
-  # Which setpoint set is in effect (for the status line).
-  sp_tag: "{{ 'away' if away_active else 'boost' if boost_active else 'sleep' if use_night_sp else 'day' }}"
-  # Plain-English explanation of what this room is doing and why (for status_helper).
+  # Which target is in effect, for the status line.
+  sp_tag: >-
+    {{ 'away target' if away_active
+       else ('boost, ' ~ boost_left ~ ' min left') if (boost_active and boost_minutes | float(0) > 0)
+       else 'boost' if boost_active
+       else 'night target' if use_night_sp else 'day target' }}
+  # Short, plain-English status: what this room is doing and why (for status_helper).
   room_status: >-
-    {%- if bypassed -%}Manual override ON - not controlling this damper
-    {%- elif purging -%}Circulation purge - damper open, fan circulating (mold prevention){% if temp_valid %} - {{ temp | round(1) }}°{% endif %}
-    {%- elif forced_open and not (enabled_on and active and raw_demand in ['cool', 'heat']) -%}Relief valve open (pressure relief){% if temp_valid %} - {{ temp | round(1) }}°{% endif %}
-    {%- elif not enabled_on -%}Off (disabled)
-    {%- elif not temp_valid -%}No temperature reading
-    {%- elif not active -%}Idle - {{ temp | round(1) }}° (not eligible: occupancy/schedule)
-    {%- elif raw_demand == 'cool' -%}Cooling{{ ' (relief valve open)' if forced_open else ' (yielding to priority)' if priority_served else '' }} - {{ temp | round(1) }}° vs {{ cool_sp | round(1) }}° target ({{ sp_tag }})
-    {%- elif raw_demand == 'heat' -%}Heating{{ ' (relief valve open)' if forced_open else ' (yielding to priority)' if priority_served else '' }} - {{ temp | round(1) }}° vs {{ heat_sp | round(1) }}° target
-    {%- elif cool_riding and not priority_served -%}Riding along (pressure relief) - {{ temp | round(1) }}°, taking cool air down to {{ (cool_sp - cool_ride_along_margin) | round(1) }}°
-    {%- else -%}Idle - {{ temp | round(1) }}° (cool above {{ cool_sp | round(1) }}°{% if has_heat_sp %}, heat below {{ heat_sp | round(1) }}°{% endif %}) ({{ sp_tag }})
+    {%- set t = temp | round(1) -%}
+    {%- set verb = 'cooling' if raw_demand == 'cool' else 'heating' -%}
+    {%- set target = (cool_sp if raw_demand == 'cool' else heat_sp) | round(1) -%}
+    {%- if bypassed -%}Manual override - leaving this damper alone
+    {%- elif purging -%}Airing out the ducts while nobody's home{% if temp_valid %} · {{ t }}°{% endif %}
+    {%- elif forced_open and not (enabled_on and active and raw_demand in ['cool', 'heat']) -%}Open to ease duct pressure{% if temp_valid %} · {{ t }}°, closes at {{ relief_floor | round(1) }}°{% endif %}
+    {%- elif force_open_flag and relief_too_cold and raw_demand != 'heat' -%}Too cold to take extra air · {{ t }}°, reopens at {{ (relief_floor + hysteresis) | round(1) }}°
+    {%- elif not enabled_on -%}Turned off
+    {%- elif not temp_valid -%}No temperature reading - keeping the damper closed
+    {%- elif not active -%}Unoccupied, so not conditioning · {{ t }}°
+    {%- elif raw_demand in ['cool', 'heat'] and priority_served and not forced_open -%}Wants {{ verb }}, but the {{ yield_to_name }} gets the air first · {{ t }}° → {{ target }}°
+    {%- elif raw_demand in ['cool', 'heat'] and not should_open -%}Wants {{ verb }} - waiting for the unit to switch over · {{ t }}° → {{ target }}°
+    {%- elif raw_demand in ['cool', 'heat'] -%}{{ verb | capitalize }} · {{ t }}° → {{ target }}° ({{ sp_tag }})
+    {%- elif cool_riding and not priority_served -%}Open as a spare vent while the unit cools · {{ t }}°, closes at {{ (cool_sp - cool_ride_along_margin) | round(1) }}°
+    {%- else -%}Comfortable · {{ t }}° (cools above {{ cool_sp | round(1) }}°{% if has_heat_sp %}, heats below {{ heat_sp | round(1) }}°{% endif %}, {{ sp_tag }})
     {%- endif -%}
 
 # Optional toggles can't be plain state triggers (an unset input is an empty dict),
@@ -717,6 +800,13 @@ trigger:
   - platform: template
     value_template: "{{ t_boost is string and is_state(t_boost, 'off') }}"
     id: boost_off
+  # Fires when the boost has been on for its auto-off time (0 = fires at once,
+  # and the action ignores it).
+  - platform: template
+    value_template: "{{ t_boost is string and is_state(t_boost, 'on') }}"
+    for:
+      minutes: !input boost_minutes
+    id: boost_timeout
   - platform: template
     value_template: "{{ t_force_open is string and is_state(t_force_open, 'on') }}"
     id: force_open_on
@@ -762,6 +852,17 @@ action:
               value: "{{ room_status }}"
   - condition: template
     value_template: "{{ not bypassed }}"
+
+  # Comfort boost ran its time -> switch it off. This run already treats the
+  # boost as off; turning the toggle off re-triggers a fresh run anyway.
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ boost_expired }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: "{{ boost_boolean }}"
 
   # WATCHDOG: always publish (no early abort). On an invalid/missing temperature
   # raw_demand computes to 'none' (the want_* checks require a valid temp), so a
